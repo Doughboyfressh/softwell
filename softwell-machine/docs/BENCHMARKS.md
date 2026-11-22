@@ -150,11 +150,11 @@ Two more notes from the runs:
   0.652 GB/s in this one.* The 0 was a calibration quirk under
   load, not a physical rate; 0.652 GB/s is the current measured
   value and the one to quote, with the usual variance warning.
-- *No scaling curve was measured yet.* The run used `--donors 1`
-  only, so `donorsToBeat` is a linear projection from one donor's
-  rate, not a measured curve. The `--donors N` curve (which the
-  harness supports) still needs a quiet-machine run to check
-  whether per-donor rates hold as donors grow.
+- *Scaling curve measured — see "Scaling curve (measured
+  2026-11-22)" below.* The `--donors 2` run shows capacity and
+  cores scaling exactly linearly, throughput flat-to-modestly-up on
+  this shared host. `donorsToBeat` remains a linear projection from
+  per-donor rates, not a measured multi-host curve.
 
 ### What the numbers actually say
 
@@ -164,10 +164,45 @@ predicts: one 4-core CPU donor's FP32 matmul is ~10⁶x short of a
 Rubin's BF16 tensor cores, and loopback-HTTP page transfers are
 ~10⁴x short of HBM3e. The interesting columns are `donors-to-beat`
 (capacity: 179 donors of 1 GiB; vSSD sequential read: 627 donors;
-vCPU cores: 48 donors) and the scaling curve that still needs
-measuring: those are the numbers that decide whether pooling can
-ever close the gap, and at what donor count the network stops the
-curve from being linear.
+vCPU cores: 48 donors) and the scaling curve below: those are the
+numbers that decide whether pooling can ever close the gap, and at
+what donor count the network stops the curve from being linear.
+
+## Scaling curve (measured 2026-11-22)
+
+`npm run bench -- --donors 2 --json bench-results-2026-11-22-donors2.json`
+(37 rows, exit 0, 195 s). Machine: AMD EPYC 9D64, 4 cores visible,
+7.7 GiB RAM, Node v24.22.1, linux x64. Same conditions warning as
+above: shared host, run-to-run variance of 2–3x on throughput rows.
+The 1-donor column below is from this same run (the vGPU module
+measures in-process and over-HTTP rows; the HTTP aggregate row is
+the one quoted).
+
+| metric | 1 donor | 2 donors | scaling |
+|---|---|---|---|
+| vGPU aggregate matmul TFLOPS (FP32, 1024^3, over HTTP) | 0.00045 | 0.00150 | ~3x (noisy; the two 1-donor measurements in this run were 0.00154 in-process vs 0.00045 over HTTP) |
+| vGPU memory bandwidth (copy/add, FP32) | 2.75 GB/s | 2.83 GB/s | flat |
+| vCPU virtual cores | 4 | 8 | exact linear (2/2 donors reported real core counts) |
+| vCPU FP64 TFLOPS (FMA) | 0.00148 | 0.00170 | flat |
+| vRAM sequential read (256 MiB) | 0.260 GB/s | 0.314 GB/s | modest gain |
+| vRAM sequential write (256 MiB) | 0.311 GB/s | 0.257 GB/s | flat / noise |
+| vRAM pooled capacity | 1.07 GB | 2.15 GB | exact linear |
+| vRAM single-page read latency | 9.7 ms | 7.5 ms | noise |
+| vSSD sequential read | 0.226 GB/s | 0.203 GB/s | flat |
+| vSSD sequential write | 0.182 GB/s | 0.190 GB/s | flat |
+| vSSD random 4 KiB read | 3,900 IOPS | 3,778 IOPS | flat |
+
+What the curve says: **capacity and cores scale exactly linearly;
+throughput does not move on this host.** Every donor here is an
+in-process server sharing the same 4 host cores and one event loop,
+so a second donor adds no new silicon — aggregate throughput is
+capped by the host, and per-donor rates fall as donors grow. That
+is why `donorsToBeat` is computed from the per-donor rate and
+labelled a linear projection: it is the donor count that would beat
+the target *if* each donor were a distinct machine contributing its
+own cores, memory, and disk. A multi-host scaling curve (donors on
+separate machines) is still unmeasured and is the next thing to run
+before quoting any donor count as a plan.
 
 ## Scaling math
 
@@ -273,5 +308,5 @@ vRAM capacity 179; vSSD sequential read 103, sequential write 65,
 random 4 KiB read 1,807; vRAM read bandwidth 21,394; vGPU matmul
 vs B200 BF16 1,308,060 (1024^3) and vs Rubin 2,325,439. Closest
 gaps remain capacity/cores/SSD throughput; compute vs tensor-core
-targets remains 6 orders of magnitude out. No scaling curve
-(`--donors N`) has been measured yet.
+targets remains 6 orders of magnitude out. The `--donors 2`
+scaling curve has now been measured — see the section below.
