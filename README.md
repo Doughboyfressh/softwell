@@ -1,9 +1,7 @@
 # softwell
 
-**Pi's software GPU. The program is the chip.**
-
-softwell is a virtual computer for running trillion-parameter open-weight
-LLMs at frontier speeds — and the web app that shows it off. The machine
+A virtual computer for running trillion-parameter open-weight LLMs at
+frontier speeds — and the web app that shows it off. The machine
 is 100% virtual: a virtual GPU, virtual CPU, virtual SSD, and virtual
 RAM pooled across donor machines, with an OpenAI-compatible inference
 runtime and server on top. Physical machines only donate cycles and
@@ -104,8 +102,8 @@ at ~5 tok/s on the reference host.
 
 The root of this repo is the original softwell web app (Vite +
 TanStack Start + React 19, Postgres/PGlite, Vercel) — the interactive
-face of Pi's software GPU, where the CPU, RAM, and SSD share one
-clock and the GPU waits on the same register.
+face of softwell, where the CPU, RAM, and SSD share one clock and the
+GPU waits on the same register.
 
 ```sh
 npm install

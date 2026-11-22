@@ -165,8 +165,7 @@ The intended fit:
   `/v1/models`) and the cluster API (`/v1/cluster`) that this repo
   already serves — the dashboard in `src/dashboard/` is the reference
   version of that UI.
-- The repo's tagline, "Pi's software GPU. The program is the chip," is
-  now literal: the program *is* the virtual GPU, CPU, RAM, and SSD.
+- The original idea is now literal: the program *is* the virtual GPU, CPU, RAM, and SSD.
 - A trillion-parameter model is served by pointing the machine at enough
   donors; the web app never sees the difference between 2 donors and 200.
 
