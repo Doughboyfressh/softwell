@@ -4,6 +4,7 @@ import { SAMPLES } from "@/lib/softwell/samples";
 import { runPi, type ProgramResult } from "@/lib/softwell/pi";
 import { PHASES, SMS_PER_DIE } from "@/lib/softwell/silicon";
 import { BUS_BYTES, TMEM_BYTES } from "@/lib/softwell/chip";
+import { RAM_BYTES, SSD_BYTES_PER_CYCLE, SSD_PAGE } from "@/lib/softwell/board";
 
 function cn(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -39,6 +40,9 @@ const COMPARE = [
   ["ISA", "PTX + pi.mma 4×4", "SASS"],
   ["Power", "the program", "up to 1,400 W"],
   ["Chip", "this program", "a module"],
+  ["CPU", "1 statement / cycle", "not this CPU"],
+  ["RAM", "64 KB", "not this RAM"],
+  ["SSD", `${SSD_BYTES_PER_CYCLE} B/cycle`, "not this SSD"],
 ];
 
 export function SoftwellApp() {
@@ -130,11 +134,13 @@ export function SoftwellApp() {
       <main className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6">
         <section className="flex flex-col gap-4">
           <p className="max-w-3xl text-base leading-relaxed text-fg">
-            The software is the chip. One gpu for is one kernel. %tid.x picks the pair, and each operand is
-            written on the {BUS_BYTES}-byte bus once. A shared row stays in the {TMEM_BYTES / 1024} KB of TMEM.
-            A thread owns a 4×4 tile. The tiles that fit on the SMs are one wave, so the pipe runs once. The block
-            is 8, checked against FP32. A B300 is a different device — 160 SMs, NVFP4 in blocks of 16, 288 GB, up
-            to 1,400 W. The same multiply is scored against that format. It is not what is running.
+            The software is the chip. The CPU pages the program off the SSD into {RAM_BYTES / 1024} KB of RAM,
+            retires one Pi statement per cycle, and the GPU launch continues that same register while the CPU waits. One gpu for is one kernel. %tid.x
+            picks the pair, and each operand is written on the {BUS_BYTES}-byte bus once. A shared row stays in
+            the {TMEM_BYTES / 1024} KB of TMEM. A thread owns a 4×4 tile. The tiles that fit on the SMs are one
+            wave, so the pipe runs once. The block is 8, checked against FP32. A B300 is a different device —
+            160 SMs, NVFP4 in blocks of 16, 288 GB, up to 1,400 W. The same multiply is scored against that
+            format. It is not what is running.
           </p>
           <div className="overflow-x-auto rounded-md border border-line">
             <table className="w-full border-collapse text-left">
@@ -204,7 +210,8 @@ export function SoftwellApp() {
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <h2 className="text-sm font-semibold">Pi GPU</h2>
               <p className="font-mono text-xs text-faint">
-                clock {event ? event.cycle : result?.ok ? result.cycles : 0} · 256 SMs · {SMS_PER_DIE} on each half
+                clock {playing && event ? event.cycle : result?.ok ? result.cycles : 0}
+                {result?.ok ? ` · gpu ${result.gpuCycles}` : ""} · 256 SMs · {SMS_PER_DIE} on each half
               </p>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -241,6 +248,16 @@ export function SoftwellApp() {
                 tmem {TMEM_BYTES / 1024} KB · {result.tmemHits} hits · {result.tmemServed} B kept on the chip
               </p>
             ) : null}
+            {result?.ok ? (
+              <p className="font-mono text-xs leading-relaxed text-faint">
+                cpu {result.cpu} statements · ram {result.ramUsed} / {RAM_BYTES} B · ssd {result.ssdPages}{" "}
+                {result.ssdPages === 1 ? "page" : "pages"} · {result.ssdBytes} B · {result.ssdCycles} of the clock
+              </p>
+            ) : (
+              <p className="font-mono text-xs leading-relaxed text-faint">
+                cpu idle · ram 0 / {RAM_BYTES} B · ssd page {SSD_PAGE} B
+              </p>
+            )}
             <div>
               <h3 className="font-mono text-xs text-faint">PTX</h3>
               <p className="mt-1 font-mono text-xs text-faint">
@@ -297,11 +314,13 @@ export function SoftwellApp() {
 
         <footer className="border-t border-line pt-4 text-sm leading-relaxed text-muted">
           <p>
-            The clock is the cycle register this run advances. The bus moves {BUS_BYTES} bytes per cycle. The
-            listing is PTX; pi.dot.block8.f32 is this chip's opcode, and the interpreter runs that listing. A B300,
-            for the score only, is published silicon: Blackwell Ultra, 160 SMs, 288 GB HBM3e at 8 TB/s, dense
-            NVFP4 around 1.5× a B200, up to 1,400 W. This clock is not that module's clock, and this listing is
-            not its SASS.
+            The clock is one register. The SSD page-in advances it, each host statement advances it, and the GPU
+            launch advances it while the CPU waits. The bus moves {BUS_BYTES} bytes per cycle of that GPU wait. The
+            program is copied off the SSD, {SSD_BYTES_PER_CYCLE} bytes a cycle, into the {RAM_BYTES / 1024} KB of RAM
+            the bus reads. The listing is PTX; pi.dot.block8.f32 is this chip's opcode, and the interpreter runs
+            that listing. A B300, for the score only, is published silicon: Blackwell Ultra, 160 SMs, 288 GB HBM3e
+            at 8 TB/s, dense NVFP4 around 1.5× a B200, up to 1,400 W. This clock is not that module's clock, and
+            this listing is not its SASS.
           </p>
           <p className="mt-2">
             Pi, the language, is{" "}

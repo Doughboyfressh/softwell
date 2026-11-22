@@ -12,6 +12,7 @@ import {
 } from "./nvfp4";
 import { launch, spanEvents, type DieEvent, type Phase } from "./silicon";
 import { Chip, MMA_M, MMA_N, PTX_KERNEL, PTX_MMA, issueGrid, issueTiles, tally } from "./chip";
+import { Board } from "./board";
 
 export type Proof = {
   name: string;
@@ -36,11 +37,18 @@ export type ProgramResult =
       isa: string[];
       macs: number;
       cycles: number;
+      /** Cycles the GPU added. The rest of `cycles` is the SSD page-in and the CPU. */
+      gpuCycles: number;
       busBytes: number;
       busBeats: number;
       tmemHits: number;
       tmemMisses: number;
       tmemServed: number;
+      cpu: number;
+      ramUsed: number;
+      ssdBytes: number;
+      ssdPages: number;
+      ssdCycles: number;
       /** Max |Δ| of the same multiply quantized as B300 NVFP4, block of 16. Null if no tensor word ran. */
       b300Measured: number | null;
       fp8MaxAbs: number | null;
@@ -447,6 +455,7 @@ type Machine = {
   dots: { measured: number; bound: number; holds: boolean; b300: number; fp: number; a: number[]; b: number[]; value: number }[];
   tiles: { rows: number[][]; cols: number[][]; values: number[][]; defect: number[][] }[];
   entry: "dot" | "mma" | "none";
+  board: Board;
 };
 
 const MAX_LOOPS = 200_000;
@@ -778,13 +787,17 @@ function runGpu(s: Extract<Stmt, { k: "gpu" }>, frame: Frame, m: Machine) {
   const threads = tiles.length > 0 ? tiles.length : dots.length;
   m.issues.push(
     tiles.length > 0
-      ? `// grid %tid.x  threads ${threads}  tile ${shape}  wave ${"waves" in grid ? grid.waves : 1}  pipe once  operands ${grid.unique} stored once  tmem hits ${hits}  misses ${misses}  clock ${m.chip.cycle}  bus ${moved} B`
+      ? `// grid %tid.x  threads ${threads}  tile ${shape}  wave ${"waves" in grid ? grid.waves : 1}  pipe once  operands ${grid.unique} stored once  tmem hits ${hits}  misses ${misses}  clock ${m.chip.cycle}  gpu ${m.chip.cycle - cycle0}  bus ${moved} B`
       : `// grid %tid.x  threads ${threads}  operands ${grid.unique} stored once  tmem hits ${hits}  misses ${misses}  clock ${m.chip.cycle}  bus ${moved} B`,
     `// residual ${mark}${dots.length > 0 ? `  |Δ|=${measured.toExponential(3)}  bound=${bound.toExponential(3)}  b300=${b300.toExponential(3)}` : ""}`,
   );
 }
 
 function execOne(s: Stmt, frame: Frame, m: Machine) {
+  if (m.inGpu === 0) {
+    m.board.retire();
+    m.chip.cycle += 1;
+  }
   switch (s.k) {
     case "let":
       frame.set(s.name, evalExpr(s.e, frame, m));
@@ -1035,7 +1048,11 @@ export function runPi(source: string): ProgramResult {
       dots: [],
       tiles: [],
       entry: "none",
+      board: new Board(),
     };
+    const heap = machine.board.pageIn(source.length);
+    machine.chip.seat(heap);
+    machine.chip.cycle += machine.board.ssdCycles;
     let value: unknown = null;
     try {
       exec(main.body, new Map(), machine);
@@ -1087,11 +1104,17 @@ export function runPi(source: string): ProgramResult {
       isa: machine.isa,
       macs: machine.macs,
       cycles: machine.chip.cycle || machine.cycles,
+      gpuCycles: machine.chip.beats.reduce((sum, beat) => sum + beat.cycles, 0) + machine.chip.stalls.reduce((sum, stall) => sum + stall.cycles, 0),
       busBytes: machine.chip.bytes,
       busBeats: machine.chip.beats.length,
       tmemHits: machine.chip.tmemHits,
       tmemMisses: machine.chip.tmemMisses,
       tmemServed: machine.chip.tmemServed,
+      cpu: machine.board.cpu,
+      ramUsed: machine.chip.used,
+      ssdBytes: machine.board.ssdBytes,
+      ssdPages: machine.board.ssdPages,
+      ssdCycles: machine.board.ssdCycles,
       b300Measured: machine.b300Measured,
       fp8MaxAbs: machine.fp8MaxAbs,
       note: machine.note,

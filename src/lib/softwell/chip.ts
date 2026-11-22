@@ -1,4 +1,5 @@
 import { PI_BLOCK, dotNvfp4, gemmNvfp4, type GemmResult } from "./nvfp4";
+import { RAM_BYTES } from "./board";
 import { SMS_PER_DIE, type Phase } from "./silicon";
 
 /** Bytes moved in one cycle. A software beat, not an HBM pin. */
@@ -37,19 +38,33 @@ export class Chip {
   tmemServed = 0;
   private words = new Map<number, number>();
   private u64 = new Map<number, number>();
-  private next = 0x1000;
+  private next = 0;
   private tmem = new Map<number, { values: number[]; bytes: number; used: number }>();
   private tmemUsed = 0;
   private tmemStamp = 0;
 
+  /** Bytes occupied in RAM, including the program that was paged in. */
+  get used(): number {
+    return this.next;
+  }
+
+  /** The program occupies [0, base). The heap starts at base. */
+  seat(base: number) {
+    if (base < 0 || base > RAM_BYTES) throw new Error("RAM: program does not fit");
+    this.next = base;
+  }
+
   alloc(nFloats: number): number {
-    const addr = this.next;
-    this.next += nFloats * WORD;
-    return addr;
+    return this.claim(nFloats * WORD);
   }
 
   allocBytes(n: number): number {
-    if (this.next % 8) this.next += 8 - (this.next % 8);
+    if (this.next % 8) this.claim(8 - (this.next % 8));
+    return this.claim(n);
+  }
+
+  private claim(n: number): number {
+    if (n < 0 || this.next + n > RAM_BYTES) throw new Error("RAM: allocation does not fit");
     const addr = this.next;
     this.next += n;
     return addr;
