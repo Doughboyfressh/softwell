@@ -264,6 +264,30 @@ target, `donorsToBeat = ceil(8000 / 2) = 4,000` donors.
   the pool, every vGPU number is a CPU-fallback number, and the
   donors-to-beat for compute will be large. That is the measurement
   doing its job, not a reason to adjust it.
+- **Decoding loses on this CPU backend.** Speculative decoding
+  measures 0.80× (demo-10m) / 0.56× (demo-100m) and Jacobi 0.76× /
+  0.52× vs autoregressive, at β ≈ 1 (a batched forward costs ~one
+  single-row forward per row). The theorems predict exactly this;
+  the win needs bandwidth-bound hardware (β < 1) and a drafter with
+  a real acceptance rate. The 92% acceptance in the bench is an
+  artifact of random-weight models collapsing to a constant token.
+- **Attention wins are data-conditional.** Landmark/sparse win big
+  only where the data satisfies their thresholds (coherent keys /
+  concentrated attention), and at headDim 64 those thresholds are
+  strict (see "Novel paths" above). On incoherent data they fall
+  back to exact attention at 0.72–1.15× the cost. No perplexity
+  impact has been measured on a real model.
+- **SW-code saves bytes, not time, in-process.** Packed weights
+  measure 0.14–0.35× tokens/s and quantized KV 0.58–0.82× on this
+  backend: the unpack cost dominates because there is no slow link
+  for the traffic saving to pay against. SW2's 72% per-layer RMS
+  error on synthetic weights would badly damage a real model;
+  perplexity impact of all SW modes on a real model is unmeasured.
+- **All novel-path speedups are measured on random-weight models.**
+  Greedy output collapses to a constant token; acceptance rates,
+  and any quality claim, are artifacts until measured on a trained
+  model. Single-rep timings on a shared host; ratios are stable,
+  absolute times are not.
 
 ## Hardware the numbers were measured on
 
@@ -310,3 +334,132 @@ vs B200 BF16 1,308,060 (1024^3) and vs Rubin 2,325,439. Closest
 gaps remain capacity/cores/SSD throughput; compute vs tensor-core
 targets remains 6 orders of magnitude out. The `--donors 2`
 scaling curve has now been measured — see the section below.
+
+## Novel paths (wave 2, measured 2026-11-22)
+
+`npm run bench:novel` (`src/bench/novel-bench.ts`) — Part A:
+attention-only prefill scaling; Part B: end-to-end prefill/decode
+per config on the demo models. Reproduce with
+`npm run bench:novel -- --json novel-bench-results-2026-11-22.json`.
+Raw JSON: `novel-bench-results-2026-11-22.json` (65 rows; Part A and
+Part B were run as two invocations of the same harness after a
+service restart killed the first combined run mid–Part B; the rows
+are concatenated unchanged, and the Part A re-run reproduced the
+killed run's ratios).
+
+Machine: AMD EPYC 9D25 126-Core Processor (4 cores), 7.7 GiB RAM,
+Node v24.22.1, linux x64. Models: demo-10m (10M params, random
+weights) and demo-100m (104.37M params, hidden 1024, 12 layers,
+random weights, `demo/models/demo-100m/`). Part B: prompt 128, 16
+generated tokens, greedy, one rep per config. Part A: synthetic K/V,
+16 heads / 8 KV heads / headDim 64, one rep per cell.
+
+> **Read these with their conditions attached, as above.** Absolute
+> times move ~40% between runs on this shared host (Part A exact
+> n=2048: 8,689 ms in one run, 12,562 ms in the next); the
+> *ratios* are stable across runs and are the finding. Part B
+> configs ran sequentially and the host drifted during the 100m run:
+> TTFT for the configs run after the SW-weight configs is inflated
+> ~1.5× (kv/spec/jacobi TTFT 36–40 s vs baseline 24.7 s, while
+> landmark/sparse, run first, show TTFT *below* baseline) — decode
+> tokens/s is the more reliable comparison for those rows. All
+> speedups are on random-weight models whose greedy output collapses
+> to a constant token.
+
+### Part A — attention-only prefill (wall ms, speedup vs exact)
+
+Regimes (exact parameters in `src/bench/novel-bench.ts`):
+*coherent* — block-constant keys + N(0, 0.001) noise per element
+(within-block radius R_b ≈ 0.01, δ_b ≈ 0.01 ≤ δ_max = 0.05);
+*concentrated* — block 0 keys at +12u, all other blocks at −12u,
+queries at +4u (logit gap ≈ 12); *incoherent* — iid N(0,1) keys.
+`ops` is counted multiply-adds vs exact; `err` is max L2 error vs
+exact prefill, with the theorem bound in parentheses. No bound was
+violated in any run; measured errors run ~10³× below the bounds.
+
+| regime / mode | n=256 | n=512 | n=1024 | n=2048 | n=4096 |
+|---|---|---|---|---|---|
+| coherent / landmark | 1.47× (ops 0.24×) | 4.66× (0.15×) | 9.84× (0.09×) | 15.41× (0.06×) | 20.41× (0.04×) |
+| coherent / sparse | 0.76× (1.04×) | 0.99× (1.03×) | 1.01× (1.02×) | 1.00× (1.01×) | 0.90× (1.01×) |
+| concentrated / sparse | 1.92× (0.33×) | 5.17× (0.21×) | 6.64× (0.14×) | 10.46× (0.10×) | 9.04× (0.12×) |
+| concentrated / landmark | 0.68× (1.02×) | 0.98× (1.01×) | 0.91× (1.00×) | 0.94× (1.00×) | 1.02× (1.00×) |
+| incoherent / landmark | 0.91× (1.02×) | 0.90× (1.01×) | 0.90× (1.00×) | 0.92× (1.00×) | 0.72× (1.00×) |
+| incoherent / sparse | 0.96× (1.04×) | 0.96× (1.03×) | 0.96× (1.02×) | 0.94× (1.01×) | 1.15× (1.01×) |
+
+Exact prefill scales ~4× per length doubling (coherent: 245 → 730 →
+3,184 → 12,562 → 45,906 ms); landmark on coherent data scales ~2.4×
+per doubling and sparse on concentrated data ~2.7×. Errors:
+landmark/coherent max err 3.3–3.9e-3 vs bound ~11; sparse/
+concentrated max err 0.75–1.8e-3 vs bound 0.1–1.3; every fallback
+cell has max err exactly 0.0 (the fallback *is* exact attention).
+
+**The calibration lesson, stated plainly.** The first version of
+this bench used coherent noise 0.01 and concentrated alignment ±3u
+— and measured ~1.0× everywhere, because the approximation
+thresholds never triggered: at headDim 64, δ_b = scale·‖q‖·R_b
+grows as √d for fixed per-element noise (‖q‖ ≈ 8, R_b ≈ 0.08 at
+noise 0.01, so δ_b ≈ 0.08 > δ_max = 0.05), and the sparse mass
+bound needs a logit gap above ln(B/1e-3) ≈ 10.7, which ±3u does not
+provide (gap ≈ 1.5). The regimes were recalibrated to data the
+theorems actually cover (noise 0.001; alignment ±12u) — the win is
+real, but it is *conditional on data satisfying the thresholds*, and
+at d=64 that is a strong condition on real KV caches, whose
+within-block dispersion is unmeasured. The fallback cost is small
+(ops 1.00–1.04×) except for one case: landmark on incoherent data
+at n=4096 measures 0.72×, because the reference implementation
+builds a per-item object list for every position in the fallback
+path — an implementation cost, not a theorem cost.
+
+### Part B — end-to-end, prompt 128, 16 tokens
+
+| config | demo-10m TTFT | demo-10m tok/s | demo-100m TTFT | demo-100m tok/s |
+|---|---|---|---|---|
+| baseline | 2,471 ms | 52.08 (1.00×) | 24,656 ms | 5.17 (1.00×) |
+| landmark | 2,308 ms | 54.38 (1.04×) | 22,642 ms | 5.10 (0.99×) |
+| sparse | 2,309 ms | 51.98 (1.00×) | 23,103 ms | 4.98 (0.96×) |
+| sw2 weights | 6,388 ms | 18.24 (0.35×) | 127,195 ms | 0.74 (0.14×) |
+| sw3 weights | 10,766 ms | 10.70 (0.21×) | 148,101 ms | 0.74 (0.14×) |
+| sw4 weights | 10,787 ms | 10.53 (0.20×) | 150,473 ms | 0.73 (0.14×) |
+| kv-sw3 | 2,671 ms | 42.72 (0.82×) | 38,169 ms | 3.06 (0.59×) |
+| kv-sw4 | 2,799 ms | 40.88 (0.79×) | 40,263 ms | 2.99 (0.58×) |
+| speculative (K=4) | 2,471 ms | 41.82 (0.80×), 5 forwards, α=92% | 36,712 ms | 2.91 (0.56×), 5 forwards, α=92% |
+| jacobi (K=4) | 2,371 ms | 39.79 (0.76×), 6 forwards | 36,364 ms | 2.71 (0.52×), 6 forwards |
+
+What this says, without flattery:
+
+- **Attention end-to-end is a wash at prompt 128** (0.96–1.04×).
+  Attention is a small fraction of a step at that length, and the
+  demo models' keys are incoherent, so landmark/sparse degrade to
+  exact attention (their logits match exact to 0.0 on demo-10m).
+  The Part A win only shows end-to-end at long context, which this
+  run did not measure — a 1k–4k-prompt end-to-end run is the missing
+  measurement.
+- **SW-code weights measure 5–7× slower in-process** (0.14–0.35×
+  tok/s), not faster. The packed matmul's unpack cost dominates
+  because there is no slow link in-process for the traffic saving
+  to pay against — the weights never leave this machine's memory.
+  The saving that *is* realized is memory: the 10m stage shrinks
+  from 37.9 MB to 3.3 MB (sw2) / 4.5 MB (sw3) / 5.7 MB (sw4). On
+  100m all three SW modes measure identically (~0.14×), i.e. the
+  packed-matmul cost is bit-width-insensitive at this scale; the
+  10m sw2-vs-sw3 gap (0.35× vs 0.21×) is within run-to-run noise
+  and is not claimed as a property of sw2.
+- **Quantized KV measures slower too** (0.58–0.82×): the packed-KV
+  attention path pays unpack cost per step.
+- **Speculative/Jacobi lose wall-clock, as the theorems predict at
+  β ≈ 1** (0.80×/0.76× on 10m, 0.56×/0.52× on 100m — worse than
+  wave 1's 0.91×/0.53× on a short prompt, because longer prompts
+  make each batched row more expensive). They do cut target
+  forwards (5–6 vs 16 for 16 tokens). The 92% acceptance rate is
+  an artifact of the random-weight models collapsing to a constant
+  token, not a property of the n-gram drafter — do not quote it as
+  drafter quality.
+- **Nothing here refutes the theorems.** The error bounds held
+  (Part A), the op-count scaling held (Part A), the β≈1 cost model
+  predicted the decoding losses (Part B), and the traffic ratios
+  held (wave 1). What the end-to-end numbers show is that on this
+  compute-bound, single-machine, in-process backend, *time is spent
+  on FLOPs, not on moving bytes across a slow link* — so inventions
+  that save bytes do not save time here. Their wins live where
+  bytes cross a slow boundary (multi-donor serving) or where FLOPs
+  are actually removed (attention at long context).

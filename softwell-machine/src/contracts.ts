@@ -144,7 +144,45 @@ export interface StageExecutor {
 
 export interface EngineBackend {
   readonly name: string; // e.g. "softwell-ts" (reference) — "cuda-fp8" later
-  createStageExecutor(manifest: ModelManifest, assignment: ShardAssignment): StageExecutor;
+  createStageExecutor(
+    manifest: ModelManifest,
+    assignment: ShardAssignment,
+    options?: EngineOptions,
+  ): StageExecutor;
+}
+
+/**
+ * Engine options: which novel paths a stage executor uses. All fields
+ * default to the baseline (exact attention, fp32 weights and KV,
+ * autoregressive decoding) when omitted — see DEFAULT_ENGINE_OPTIONS in
+ * src/engine/options.ts. These are additive: existing callers that pass
+ * no options get exactly the v1 behaviour.
+ *
+ * - attention: "exact" (grouped-query attention), "landmark" (Theorem A1,
+ *   docs/research/01-attention.md), "sparse" (Theorem A2).
+ * - weightFormat: how projection weights are stored and multiplied:
+ *   "fp32" (baseline) or SW-code "sw2"/"sw3"/"sw4" (Theorem N1,
+ *   docs/research/02-numbers.md).
+ * - kvFormat: how the KV cache is stored for attention: "fp32" (baseline)
+ *   or SW-code "sw2"/"sw3"/"sw4" (Theorem N2).
+ * - decoding: how the scheduler generates tokens for a sequence:
+ *   "autoregressive" (baseline), "speculative" (Theorem S1) or "jacobi"
+ *   (Theorem S2, docs/research/03-decoding.md). Greedy only in the
+ *   scheduler: sequences with temperature > 0 fall back to autoregressive.
+ * - draftLength: K, the draft length (speculative) / block size (Jacobi).
+ *   Default 4.
+ */
+export type AttentionMode = "exact" | "landmark" | "sparse";
+export type WeightFormat = "fp32" | "sw2" | "sw3" | "sw4";
+export type KvFormat = "fp32" | "sw2" | "sw3" | "sw4";
+export type DecodingMode = "autoregressive" | "speculative" | "jacobi";
+
+export interface EngineOptions {
+  attention?: AttentionMode;
+  weightFormat?: WeightFormat;
+  kvFormat?: KvFormat;
+  decoding?: DecodingMode;
+  draftLength?: number;
 }
 
 export interface SamplingParams {

@@ -15,8 +15,10 @@
   "private": true,
   "scripts": {
     "bench": "node src/bench/run.ts",
+    "bench:novel": "node src/bench/novel-bench.ts",
     "demo": "node demo/run-demo.ts",
     "make-demo-model": "node demo/make-demo-model.ts",
+    "make-demo-model-100m": "node demo/make-demo-model-100m.ts",
     "start": "node src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts"

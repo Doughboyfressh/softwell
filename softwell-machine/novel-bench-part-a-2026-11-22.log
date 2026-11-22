@@ -1,0 +1,70 @@
+softwell novel-paths benchmark
+Machine: AMD EPYC 9D25 126-Core Processor (4 cores), 7.7 GiB RAM, Node v24.22.1, linux x64
+models: demo-10m, demo-100m | prompt lengths: 128 | gen tokens: 16
+configs: baseline, landmark, sparse, sw2, sw3, sw4, kv-sw3, kv-sw4, speculative, jacobi | attention lengths: 256, 512, 1024, 2048, 4096
+
+=== Part A: attention-only scaling (16 heads / 8 KV heads / d=64) ===
+  attention/coherent n=256: exact 245 ms, landmark 166 ms, sparse 322 ms
+  attention/coherent n=512: exact 730 ms, landmark 156 ms, sparse 734 ms
+  attention/coherent n=1024: exact 3184 ms, landmark 323 ms, sparse 3152 ms
+  attention/coherent n=2048: exact 12562 ms, landmark 815 ms, sparse 12598 ms
+  attention/coherent n=4096: exact 45906 ms, landmark 2249 ms, sparse 51195 ms
+  attention/concentrated n=256: exact 195 ms, landmark 288 ms, sparse 101 ms
+  attention/concentrated n=512: exact 798 ms, landmark 811 ms, sparse 154 ms
+  attention/concentrated n=1024: exact 3076 ms, landmark 3393 ms, sparse 463 ms
+  attention/concentrated n=2048: exact 13039 ms, landmark 13849 ms, sparse 1247 ms
+  attention/concentrated n=4096: exact 40830 ms, landmark 40004 ms, sparse 4519 ms
+  attention/incoherent n=256: exact 135 ms, landmark 148 ms, sparse 141 ms
+  attention/incoherent n=512: exact 539 ms, landmark 597 ms, sparse 565 ms
+  attention/incoherent n=1024: exact 2219 ms, landmark 2474 ms, sparse 2306 ms
+  attention/incoherent n=2048: exact 8988 ms, landmark 9806 ms, sparse 9521 ms
+  attention/incoherent n=4096: exact 48996 ms, landmark 68396 ms, sparse 42690 ms
+
+=== Summary (speedup vs baseline in the same workload/length) ===
+attention/coherent n=256 exact          245 ms  1.00x vs exact
+attention/coherent n=256 landmark       166 ms  1.47x vs exact  ops 0.24x  max err 3.9e-3 (bound 1.0e+1)
+attention/coherent n=256 sparse         322 ms  0.76x vs exact  ops 1.04x  max err 0.0e+0 (bound 1.1e-3)
+attention/coherent n=512 exact          730 ms  1.00x vs exact
+attention/coherent n=512 landmark       156 ms  4.66x vs exact  ops 0.15x  max err 3.9e-3 (bound 1.1e+1)
+attention/coherent n=512 sparse         734 ms  0.99x vs exact  ops 1.03x  max err 0.0e+0 (bound 1.2e-3)
+attention/coherent n=1024 exact         3184 ms  1.00x vs exact
+attention/coherent n=1024 landmark       323 ms  9.84x vs exact  ops 0.09x  max err 3.9e-3 (bound 1.1e+1)
+attention/coherent n=1024 sparse        3152 ms  1.01x vs exact  ops 1.02x  max err 0.0e+0 (bound 1.2e-3)
+attention/coherent n=2048 exact        12562 ms  1.00x vs exact
+attention/coherent n=2048 landmark       815 ms  15.41x vs exact  ops 0.06x  max err 3.5e-3 (bound 1.1e+1)
+attention/coherent n=2048 sparse       12598 ms  1.00x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+attention/coherent n=4096 exact        45906 ms  1.00x vs exact
+attention/coherent n=4096 landmark      2249 ms  20.41x vs exact  ops 0.04x  max err 3.3e-3 (bound 1.1e+1)
+attention/coherent n=4096 sparse       51195 ms  0.90x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+attention/concentrated n=256 exact          195 ms  1.00x vs exact
+attention/concentrated n=256 landmark       288 ms  0.68x vs exact  ops 1.02x  max err 0.0e+0 (bound 1.1e-3)
+attention/concentrated n=256 sparse         101 ms  1.92x vs exact  ops 0.33x  max err 7.5e-4 (bound 1.0e-1)
+attention/concentrated n=512 exact          798 ms  1.00x vs exact
+attention/concentrated n=512 landmark       811 ms  0.98x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+attention/concentrated n=512 sparse         154 ms  5.17x vs exact  ops 0.21x  max err 1.1e-3 (bound 2.4e-1)
+attention/concentrated n=1024 exact         3076 ms  1.00x vs exact
+attention/concentrated n=1024 landmark      3393 ms  0.91x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/concentrated n=1024 sparse         463 ms  6.64x vs exact  ops 0.14x  max err 1.3e-3 (bound 4.6e-1)
+attention/concentrated n=2048 exact        13039 ms  1.00x vs exact
+attention/concentrated n=2048 landmark     13849 ms  0.94x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/concentrated n=2048 sparse        1247 ms  10.46x vs exact  ops 0.10x  max err 1.6e-3 (bound 8.7e-1)
+attention/concentrated n=4096 exact        40830 ms  1.00x vs exact
+attention/concentrated n=4096 landmark     40004 ms  1.02x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/concentrated n=4096 sparse        4519 ms  9.04x vs exact  ops 0.12x  max err 1.8e-3 (bound 1.3e+0)
+attention/incoherent n=256 exact          135 ms  1.00x vs exact
+attention/incoherent n=256 landmark       148 ms  0.91x vs exact  ops 1.02x  max err 0.0e+0 (bound 1.1e-3)
+attention/incoherent n=256 sparse         141 ms  0.96x vs exact  ops 1.04x  max err 0.0e+0 (bound 1.1e-3)
+attention/incoherent n=512 exact          539 ms  1.00x vs exact
+attention/incoherent n=512 landmark       597 ms  0.90x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=512 sparse         565 ms  0.96x vs exact  ops 1.03x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=1024 exact         2219 ms  1.00x vs exact
+attention/incoherent n=1024 landmark      2474 ms  0.90x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=1024 sparse        2306 ms  0.96x vs exact  ops 1.02x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=2048 exact         8988 ms  1.00x vs exact
+attention/incoherent n=2048 landmark      9806 ms  0.92x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=2048 sparse        9521 ms  0.94x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=4096 exact        48996 ms  1.00x vs exact
+attention/incoherent n=4096 landmark     68396 ms  0.72x vs exact  ops 1.00x  max err 0.0e+0 (bound 1.2e-3)
+attention/incoherent n=4096 sparse       42690 ms  1.15x vs exact  ops 1.01x  max err 0.0e+0 (bound 1.2e-3)
+
+raw results written to novel-bench-part-a-2026-11-22.json

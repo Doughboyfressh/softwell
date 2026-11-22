@@ -28,11 +28,13 @@ import { fileURLToPath } from "node:url";
 import {
   DEFAULT_ORCHESTRATOR_PORT,
   type ClusterSnapshot,
+  type EngineOptions,
   type ExecuteResponse,
   type GeneratedToken,
   type Scheduler,
   type ShardPlan,
 } from "./contracts.ts";
+import { describeEngineOptions, engineOptionsToFlags, parseEngineFlags } from "./engine/options.ts";
 import { openWeightLoader, loadManifest } from "./model/loader.ts";
 import { loadTokenizer } from "./model/tokenizer.ts";
 import { downloadModel, resolveModelRef } from "./model/hub.ts";
@@ -62,6 +64,10 @@ interface CliOptions {
   port: number;
   apiPort: number;
   memoryBytes?: number;
+  /** Novel engine paths (attention / weights / KV / decoding); all default
+   *  to the baseline. Passed to workers (engine modes) and the scheduler
+   *  (decoding mode). */
+  engineOptions: EngineOptions;
 }
 
 function printHelp(): void {
@@ -75,28 +81,38 @@ Usage:
   <model> is a local directory or a Hugging Face repo id
   (e.g. meta-llama/Llama-3.3-70B-Instruct).
 
+  Novel engine paths (all default to the baseline behaviour):
+    --attention exact|landmark|sparse   attention (Theorems A1/A2)
+    --weights fp32|sw2|sw3|sw4          weight format (SW-code, Theorem N1)
+    --kv fp32|sw2|sw3|sw4               KV-cache format (Theorem N2)
+    --decoding autoregressive|speculative|jacobi
+                                        token generation (Theorems S1/S2, greedy only)
+    --draft-length K                    draft length / Jacobi block size (default 4)
+
 Defaults: --workers ${DEFAULT_WORKERS}, --port ${DEFAULT_ORCHESTRATOR_PORT}, --api-port ${DEFAULT_API_PORT}.
 The demo model (demo/models/demo-10m) is used when no model is given and it exists.`);
 }
 
 function parseArgs(argv: string[]): CliOptions {
+  const { options: engineOptions, rest: argvRest } = parseEngineFlags(argv);
   const opts: CliOptions = {
     command: "help",
     workers: DEFAULT_WORKERS,
     port: DEFAULT_ORCHESTRATOR_PORT,
     apiPort: DEFAULT_API_PORT,
+    engineOptions,
   };
   const rest: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i] as string;
+  for (let i = 0; i < argvRest.length; i++) {
+    const a = argvRest[i] as string;
     if (a === "up") opts.command = "up";
     else if (a === "run") opts.command = "run";
     else if (a === "--help" || a === "-h") opts.command = "help";
-    else if (a === "--workers") opts.workers = Number(argv[++i]);
-    else if (a === "--port") opts.port = Number(argv[++i]);
-    else if (a === "--api-port") opts.apiPort = Number(argv[++i]);
-    else if (a === "--model-dir") opts.modelDir = argv[++i];
-    else if (a === "--memory") opts.memoryBytes = Number(argv[++i]);
+    else if (a === "--workers") opts.workers = Number(argvRest[++i]);
+    else if (a === "--port") opts.port = Number(argvRest[++i]);
+    else if (a === "--api-port") opts.apiPort = Number(argvRest[++i]);
+    else if (a === "--model-dir") opts.modelDir = argvRest[++i];
+    else if (a === "--memory") opts.memoryBytes = Number(argvRest[++i]);
     else if (a.startsWith("--")) throw new Error(`unknown flag: ${a}`);
     else rest.push(a);
   }
@@ -199,6 +215,7 @@ async function main(): Promise<void> {
     `softwell: ${manifest.modelId} — ${(manifest.totalParams / 1e6).toFixed(1)}M params, ` +
       `${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MB, ${manifest.config.numHiddenLayers} layers`,
   );
+  console.log(`softwell: engine: ${describeEngineOptions(opts.engineOptions)}`);
 
   // --- Orchestrator: mesh registry + mesh server ---------------------------
   const registry = new WorkerRegistry();
@@ -213,12 +230,22 @@ async function main(): Promise<void> {
 
   // --- Workers --------------------------------------------------------------
   const children: ChildProcess[] = [];
+  const engineFlags = engineOptionsToFlags(opts.engineOptions);
   const spawnWorker = (): void => {
     const env = { ...process.env };
     if (opts.memoryBytes) env.SOFTWELL_WORKER_MEMORY_BYTES = String(opts.memoryBytes);
     const child = spawn(
       process.execPath,
-      [WORKER_ENTRY, "--orchestrator", orchestratorUrl, "--model-dir", modelDir, "--port", "0"],
+      [
+        WORKER_ENTRY,
+        "--orchestrator",
+        orchestratorUrl,
+        "--model-dir",
+        modelDir,
+        "--port",
+        "0",
+        ...engineFlags,
+      ],
       { env, stdio: "inherit" },
     );
     children.push(child);
@@ -283,6 +310,8 @@ async function main(): Promise<void> {
   );
 
   // --- Scheduler ------------------------------------------------------------
+  // Novel decoding mode (speculative/Jacobi) is a scheduler option; the
+  // engine modes (attention/weights/KV) already went to the workers above.
   const client = new MeshClient({ timeoutMs: 30_000 });
   const schedulerInner = new ContinuousBatchingScheduler({
     plan: shardPlan,
@@ -295,6 +324,8 @@ async function main(): Promise<void> {
     decode: (ids) => tokenizer.decode(ids),
     eosTokenId: manifest.config.eosTokenId,
     rolesByWorker: Object.fromEntries(workers.map((w) => [w.workerId, w.roles])),
+    decoding: opts.engineOptions.decoding,
+    draftLength: opts.engineOptions.draftLength,
   });
   const scheduler = new InstrumentedScheduler(schedulerInner);
 

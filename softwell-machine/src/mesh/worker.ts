@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import type { Server } from "node:http";
 import { createReferenceBackend } from "../engine/backend.ts";
+import { parseEngineFlags } from "../engine/options.ts";
 import { openWeightLoader } from "../model/loader.ts";
 import { BlockPagedKVCache } from "../scheduler/kvcache.ts";
 import {
@@ -10,6 +11,7 @@ import {
 } from "../contracts.ts";
 import type {
   EngineBackend,
+  EngineOptions,
   ExecuteRequest,
   ExecuteResponse,
   PagedKVCache,
@@ -40,6 +42,10 @@ export interface StartWorkerOptions {
   capability: Omit<WorkerCapability, "host" | "port">;
   backend: EngineBackend;
   loader: WeightLoader;
+  /** Engine options for the stage executor (attention / weights / KV modes).
+   *  Omit for the baseline. The decoding mode is a scheduler concern and
+   *  does not affect the worker. */
+  engineOptions?: EngineOptions;
   /** Factory for the worker-local PagedKVCache (scheduler's implementation). Required. */
   createCache: () => PagedKVCache;
   pollIntervalMs?: number;
@@ -103,6 +109,7 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       const next = opts.backend.createStageExecutor(
         opts.loader.manifest,
         resp.assignment,
+        opts.engineOptions,
       );
       await next.load(opts.loader);
       executor = next;
@@ -326,12 +333,17 @@ async function main(): Promise<void> {
   if (modelDir === "") {
     console.error(
       "usage: node src/mesh/worker.ts [--orchestrator <url>] [--host <host>] [--port <n>] [--model-dir <dir>]\n" +
+        "  [--attention exact|landmark|sparse] [--weights fp32|sw2|sw3|sw4] [--kv fp32|sw2|sw3|sw4]\n" +
         "  env: SOFTWELL_ORCHESTRATOR_URL, SOFTWELL_WORKER_HOST, SOFTWELL_WORKER_PORT,\n" +
         "       SOFTWELL_WORKER_MEMORY_BYTES, SOFTWELL_WORKER_DEVICE, SOFTWELL_MODEL_DIR (required)",
     );
     process.exitCode = 2;
     return;
   }
+
+  // Novel engine paths (attention / weight / KV modes); defaults are the
+  // baseline. --decoding is a scheduler option and is not read here.
+  const { options: engineOptions } = parseEngineFlags(argv);
 
   // The model loader and the PagedKVCache live with their owners
   // (src/model/loader.ts, src/scheduler/kvcache.ts). The cache factory
@@ -428,6 +440,7 @@ async function main(): Promise<void> {
     backend,
     loader,
     createCache,
+    engineOptions,
     hw,
   });
 
