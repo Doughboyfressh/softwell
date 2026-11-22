@@ -1,0 +1,50 @@
+softwell novel-paths benchmark
+Machine: AMD EPYC 9D25 126-Core Processor (4 cores), 7.7 GiB RAM, Node v24.22.1, linux x64
+models: demo-10m, demo-100m | prompt lengths: 128 | gen tokens: 16
+configs: baseline, landmark, sparse, sw2, sw3, sw4, kv-sw3, kv-sw4, speculative, jacobi | attention lengths: 256, 512, 1024, 2048, 4096
+
+=== Part B: end-to-end model bench ===
+  baseline on demo-10m (prompt 128, 16 tokens): TTFT 2471 ms, decode 307 ms (52.08 tok/s), 16 forwards / 143 rows
+  landmark on demo-10m (prompt 128, 16 tokens): TTFT 2308 ms, decode 294 ms (54.38 tok/s), 16 forwards / 143 rows
+  sparse on demo-10m (prompt 128, 16 tokens): TTFT 2309 ms, decode 308 ms (51.98 tok/s), 16 forwards / 143 rows
+  sw2 on demo-10m (prompt 128, 16 tokens): TTFT 6388 ms, decode 877 ms (18.24 tok/s), 16 forwards / 143 rows
+  sw3 on demo-10m (prompt 128, 16 tokens): TTFT 10766 ms, decode 1496 ms (10.70 tok/s), 16 forwards / 143 rows
+  sw4 on demo-10m (prompt 128, 16 tokens): TTFT 10787 ms, decode 1519 ms (10.53 tok/s), 16 forwards / 143 rows
+  kv-sw3 on demo-10m (prompt 128, 16 tokens): TTFT 2671 ms, decode 375 ms (42.72 tok/s), 16 forwards / 143 rows
+  kv-sw4 on demo-10m (prompt 128, 16 tokens): TTFT 2799 ms, decode 391 ms (40.88 tok/s), 16 forwards / 143 rows
+  speculative on demo-10m (prompt 128, 16 tokens): TTFT 2471 ms, decode 383 ms (41.82 tok/s), 5 forwards / 147 rows, acceptance 92%
+  jacobi on demo-10m (prompt 128, 16 tokens): TTFT 2371 ms, decode 402 ms (39.79 tok/s), 6 forwards / 148 rows
+  baseline on demo-100m (prompt 128, 16 tokens): TTFT 24656 ms, decode 3097 ms (5.17 tok/s), 16 forwards / 143 rows
+  landmark on demo-100m (prompt 128, 16 tokens): TTFT 22642 ms, decode 3140 ms (5.10 tok/s), 16 forwards / 143 rows
+  sparse on demo-100m (prompt 128, 16 tokens): TTFT 23103 ms, decode 3215 ms (4.98 tok/s), 16 forwards / 143 rows
+  sw2 on demo-100m (prompt 128, 16 tokens): TTFT 127195 ms, decode 21668 ms (0.74 tok/s), 16 forwards / 143 rows
+  sw3 on demo-100m (prompt 128, 16 tokens): TTFT 148101 ms, decode 21766 ms (0.74 tok/s), 16 forwards / 143 rows
+  sw4 on demo-100m (prompt 128, 16 tokens): TTFT 150473 ms, decode 22053 ms (0.73 tok/s), 16 forwards / 143 rows
+  kv-sw3 on demo-100m (prompt 128, 16 tokens): TTFT 38169 ms, decode 5223 ms (3.06 tok/s), 16 forwards / 143 rows
+  kv-sw4 on demo-100m (prompt 128, 16 tokens): TTFT 40263 ms, decode 5346 ms (2.99 tok/s), 16 forwards / 143 rows
+  speculative on demo-100m (prompt 128, 16 tokens): TTFT 36712 ms, decode 5490 ms (2.91 tok/s), 5 forwards / 147 rows, acceptance 92%
+  jacobi on demo-100m (prompt 128, 16 tokens): TTFT 36364 ms, decode 5912 ms (2.71 tok/s), 6 forwards / 148 rows
+
+=== Summary (speedup vs baseline in the same workload/length) ===
+model/demo-10m p=128 baseline     TTFT    2471 ms  decode 52.08 tok/s  1.00x vs baseline  forwards 16
+model/demo-10m p=128 landmark     TTFT    2308 ms  decode 54.38 tok/s  1.04x vs baseline  forwards 16
+model/demo-10m p=128 sparse       TTFT    2309 ms  decode 51.98 tok/s  1.00x vs baseline  forwards 16
+model/demo-10m p=128 sw2          TTFT    6388 ms  decode 18.24 tok/s  0.35x vs baseline  forwards 16
+model/demo-10m p=128 sw3          TTFT   10766 ms  decode 10.70 tok/s  0.21x vs baseline  forwards 16
+model/demo-10m p=128 sw4          TTFT   10787 ms  decode 10.53 tok/s  0.20x vs baseline  forwards 16
+model/demo-10m p=128 kv-sw3       TTFT    2671 ms  decode 42.72 tok/s  0.82x vs baseline  forwards 16
+model/demo-10m p=128 kv-sw4       TTFT    2799 ms  decode 40.88 tok/s  0.79x vs baseline  forwards 16
+model/demo-10m p=128 speculative  TTFT    2471 ms  decode 41.82 tok/s  0.80x vs baseline  forwards 5
+model/demo-10m p=128 jacobi       TTFT    2371 ms  decode 39.79 tok/s  0.76x vs baseline  forwards 6
+model/demo-100m p=128 baseline     TTFT   24656 ms  decode 5.17 tok/s  1.00x vs baseline  forwards 16
+model/demo-100m p=128 landmark     TTFT   22642 ms  decode 5.10 tok/s  0.99x vs baseline  forwards 16
+model/demo-100m p=128 sparse       TTFT   23103 ms  decode 4.98 tok/s  0.96x vs baseline  forwards 16
+model/demo-100m p=128 sw2          TTFT  127195 ms  decode 0.74 tok/s  0.14x vs baseline  forwards 16
+model/demo-100m p=128 sw3          TTFT  148101 ms  decode 0.74 tok/s  0.14x vs baseline  forwards 16
+model/demo-100m p=128 sw4          TTFT  150473 ms  decode 0.73 tok/s  0.14x vs baseline  forwards 16
+model/demo-100m p=128 kv-sw3       TTFT   38169 ms  decode 3.06 tok/s  0.59x vs baseline  forwards 16
+model/demo-100m p=128 kv-sw4       TTFT   40263 ms  decode 2.99 tok/s  0.58x vs baseline  forwards 16
+model/demo-100m p=128 speculative  TTFT   36712 ms  decode 2.91 tok/s  0.56x vs baseline  forwards 5
+model/demo-100m p=128 jacobi       TTFT   36364 ms  decode 2.71 tok/s  0.52x vs baseline  forwards 6
+
+raw results written to novel-bench-part-b-2026-11-22.json
