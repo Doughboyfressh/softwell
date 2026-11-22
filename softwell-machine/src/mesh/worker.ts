@@ -14,6 +14,7 @@ import type {
   EngineOptions,
   ExecuteRequest,
   ExecuteResponse,
+  ModelManifest,
   PagedKVCache,
   ShardAssignment,
   StageExecutor,
@@ -46,8 +47,11 @@ export interface StartWorkerOptions {
    *  Omit for the baseline. The decoding mode is a scheduler concern and
    *  does not affect the worker. */
   engineOptions?: EngineOptions;
-  /** Factory for the worker-local PagedKVCache (scheduler's implementation). Required. */
-  createCache: () => PagedKVCache;
+  /** Factory for the worker-local PagedKVCache (scheduler's implementation).
+   *  Required. It receives the manifest of the model the stage was just
+   *  loaded from, so the cache is built from that model's GQA geometry —
+   *  the geometry changes when the worker switches models. */
+  createCache: (manifest: ModelManifest) => PagedKVCache;
   pollIntervalMs?: number;
   /**
    * Optional virtual-hardware node server factory. When provided it is
@@ -69,7 +73,7 @@ export interface WorkerHandle {
 
 export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandle> {
   if (typeof opts.createCache !== "function") {
-    throw new Error("startWorker requires opts.createCache: () => PagedKVCache");
+    throw new Error("startWorker requires opts.createCache: (manifest: ModelManifest) => PagedKVCache");
   }
   const client = new MeshClient();
   const pollIntervalMs = opts.pollIntervalMs ?? HEARTBEAT_INTERVAL_MS;
@@ -87,37 +91,93 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
   let tokensSinceHeartbeat = 0;
   let closed = false;
 
+  /**
+   * Weight loaders by model key (modelId when the assignment carries one,
+   * else the model dir). The spawn-time loader is seeded under its
+   * manifest's modelId, so switching back to it is a cache hit. Loaders
+   * are never evicted within a process lifetime; close() closes them all.
+   */
+  const loaders = new Map<string, WeightLoader>();
+  loaders.set(opts.loader.manifest.modelId, opts.loader);
+  /** Loader the current executor was built from (starts as spawn-time). */
+  let currentLoader: WeightLoader = opts.loader;
+  /** Cache key of `currentLoader`. */
+  let currentModelKey: string = opts.loader.manifest.modelId;
+
   const log = (...args: unknown[]): void => {
     console.log(`[worker ${workerId || "starting"}]`, ...args);
   };
+
+  /**
+   * Resolve the loader for an assignment. Absent modelDir keeps the v1
+   * behaviour (the spawn-time loader). A modelDir different from the
+   * currently loaded model opens (or reuses a cached) loader for that
+   * model. Returns null when the new model dir cannot be opened — the
+   * caller then keeps serving the old stage and retries on the next poll.
+   */
+  function loaderFor(assignment: ShardAssignment): WeightLoader | null {
+    if (assignment.modelDir === undefined) return opts.loader;
+    const key = assignment.modelId ?? assignment.modelDir;
+    if (key === currentModelKey) return currentLoader;
+    const cached = loaders.get(key);
+    if (cached !== undefined) return cached;
+    try {
+      const opened = openWeightLoader(assignment.modelDir, assignment.modelId);
+      loaders.set(key, opened);
+      return opened;
+    } catch (err) {
+      log(
+        `cannot open model dir ${assignment.modelDir} for assignment (model ${assignment.modelId ?? key}): ${err instanceof Error ? err.message : String(err)}; keeping previous stage`,
+      );
+      return null;
+    }
+  }
 
   /** Fetch the current assignment and (re)load the stage if it changed. */
   async function loadAssignment(): Promise<boolean> {
     if (loadPromise !== null) return loadPromise;
     loadPromise = (async (): Promise<boolean> => {
       const resp = await client.getAssignment(opts.orchestratorUrl, workerId);
-      knownVersion = resp.version;
-      if (resp.assignment === null) return false;
+      if (resp.assignment === null) {
+        knownVersion = resp.version;
+        return false;
+      }
       if (
         executor !== null &&
         loadedVersion === resp.version &&
         loadedAssignment !== null &&
         loadedAssignment.stage === resp.assignment.stage
       ) {
+        knownVersion = resp.version;
         return true;
       }
+      // Resolve the loader BEFORE building the stage. A model dir that
+      // cannot be opened leaves the old executor, cache, assignment and
+      // versions untouched — and knownVersion deliberately NOT advanced,
+      // so the next heartbeat/assignment poll retries the switch.
+      const loader = loaderFor(resp.assignment);
+      if (loader === null) return false;
       const next = opts.backend.createStageExecutor(
-        opts.loader.manifest,
+        loader.manifest,
         resp.assignment,
         opts.engineOptions,
       );
-      await next.load(opts.loader);
+      await next.load(loader);
       executor = next;
-      cache = opts.createCache();
+      cache = opts.createCache(loader.manifest);
+      currentLoader = loader;
+      // The cache key of the loader actually used: the spawn loader's
+      // manifest id when the assignment carries no modelDir (v1 behaviour),
+      // else the assignment's modelId/modelDir key.
+      currentModelKey =
+        resp.assignment.modelDir === undefined
+          ? loader.manifest.modelId
+          : (resp.assignment.modelId ?? resp.assignment.modelDir);
       loadedAssignment = resp.assignment;
       loadedVersion = resp.version;
+      knownVersion = resp.version;
       log(
-        `loaded stage ${resp.assignment.stage} (layers ${resp.assignment.layerStart}-${resp.assignment.layerEnd}, assignment v${resp.version})`,
+        `loaded stage ${resp.assignment.stage} (layers ${resp.assignment.layerStart}-${resp.assignment.layerEnd}, model ${loader.manifest.modelId}, assignment v${resp.version})`,
       );
       return true;
     })();
@@ -247,8 +307,12 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       log("heartbeat rejected by orchestrator (unknown worker id?)");
       return;
     }
+    // loadAssignment() owns knownVersion: it advances it only once the
+    // new assignment is actually loaded (or there is provably no
+    // assignment). A failed load leaves knownVersion behind, so the next
+    // heartbeat retries the switch instead of stranding the worker on a
+    // version it never loaded.
     if (resp.assignmentVersion > knownVersion) {
-      knownVersion = resp.assignmentVersion;
       try {
         await loadAssignment();
       } catch (err) {
@@ -278,6 +342,16 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       await hwServer.close().catch(() => undefined);
       hwServer = undefined;
     }
+    // Loaders are never evicted while the worker runs; close them all now
+    // (including the spawn-time loader seeded in the cache).
+    for (const loader of loaders.values()) {
+      try {
+        loader.close();
+      } catch {
+        // Best-effort: a loader failing to close must not fail shutdown.
+      }
+    }
+    loaders.clear();
     log("stopped");
   }
 
@@ -359,12 +433,12 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const createCache = (): PagedKVCache =>
+  const createCache = (manifest: ModelManifest): PagedKVCache =>
     new BlockPagedKVCache(
       16,
       1024,
-      loader.manifest.config.numKeyValueHeads,
-      loader.manifest.config.headDim,
+      manifest.config.numKeyValueHeads,
+      manifest.config.headDim,
     );
 
   const backend: EngineBackend = createReferenceBackend();

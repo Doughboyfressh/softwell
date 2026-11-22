@@ -40,6 +40,36 @@
 </header>
 <main>
   <section>
+    <h2>Server</h2>
+    <div class="stats">
+      <div class="stat"><b id="srv-state">—</b><span>state</span></div>
+      <div class="stat"><b id="srv-uptime">—</b><span>uptime</span></div>
+      <div class="stat"><b id="srv-tps">—</b><span>tokens / sec</span></div>
+      <div class="stat"><b id="srv-queue">—</b><span>queue depth</span></div>
+    </div>
+    <p id="srv-model" class="muted">no model active</p>
+    <div class="stats">
+      <div class="stat"><b id="req-active">—</b><span>requests active</span></div>
+      <div class="stat"><b id="req-queued">—</b><span>queued</span></div>
+      <div class="stat"><b id="req-done">—</b><span>completed</span></div>
+      <div class="stat"><b id="req-rejected">—</b><span>rejected</span></div>
+      <div class="stat"><b id="req-cancelled">—</b><span>cancelled</span></div>
+    </div>
+    <div class="stats" style="margin-top: 12px">
+      <div class="stat"><b id="srv-vram">—</b><span>vRAM used / total</span></div>
+      <div class="stat"><b id="srv-vgpu">—</b><span>vGPU devices · total TFLOP/s</span></div>
+      <div class="stat"><b id="srv-vcpu">—</b><span>vCPU cores</span></div>
+    </div>
+    <p id="srv-updated" class="muted"></p>
+  </section>
+  <section>
+    <h2>Models</h2>
+    <table>
+      <thead><tr><th>id</th><th>status</th><th>params</th><th>vRAM</th><th>requests served</th></tr></thead>
+      <tbody id="models"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+  <section>
     <h2>Throughput</h2>
     <div class="stats">
       <div class="stat"><b id="tps">—</b><span>tokens / sec</span></div>
@@ -92,6 +122,54 @@
     return v.toFixed(1) + " " + units[i];
   };
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  let activeModelId = null;
+
+  async function refreshServer() {
+    try {
+      const res = await fetch("/v1/server/status");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const st = await res.json();
+      $("srv-state").textContent = st.state ?? "—";
+      $("srv-uptime").textContent = Math.round(st.uptimeSec || 0) + "s";
+      $("srv-tps").textContent = (st.tokensPerSec ?? 0).toFixed(1);
+      $("srv-queue").textContent = st.queueDepth ?? 0;
+      activeModelId = st.activeModelId ?? null;
+      $("srv-model").textContent = activeModelId
+        ? "active model: " + activeModelId
+        : "no model active — load one with POST /v1/models/load then POST /v1/models/:id/activate (or restart with --model-dir <dir>)";
+      $("srv-model").classList.toggle("err", !activeModelId);
+      const reqs = st.requests || {};
+      $("req-active").textContent = reqs.active ?? 0;
+      $("req-queued").textContent = reqs.queued ?? 0;
+      $("req-done").textContent = reqs.completed ?? 0;
+      $("req-rejected").textContent = reqs.rejected ?? 0;
+      $("req-cancelled").textContent = reqs.cancelled ?? 0;
+      const vm = st.vm;
+      if (vm) {
+        $("srv-vram").textContent = fmtBytes(vm.vram?.usedBytes) + " / " + fmtBytes(vm.vram?.totalBytes);
+        $("srv-vgpu").textContent = (vm.gpu?.devices?.length ?? 0) + " · " + ((vm.gpu?.totalFlopsPerSec ?? 0) / 1e12).toFixed(1);
+        $("srv-vcpu").textContent = vm.cpu?.totalCores ?? 0;
+      } else {
+        $("srv-vram").textContent = "—";
+        $("srv-vgpu").textContent = "—";
+        $("srv-vcpu").textContent = "—";
+      }
+      $("srv-updated").textContent = "updated " + new Date().toLocaleTimeString();
+      $("srv-updated").classList.remove("err");
+
+      const models = st.models || [];
+      $("models").innerHTML = models.length === 0
+        ? '<tr><td colspan="5" class="muted">no models known — start the server with --model-dir &lt;dir&gt; (or softwell serve &lt;model&gt;)</td></tr>'
+        : models.map((m) => "<tr><td>" + esc(m.id) + (m.id === activeModelId ? " ★" : "") + "</td><td>" +
+            esc(m.status) + "</td><td>" +
+            (m.params != null ? (m.params / 1e6).toFixed(1) + "M" : "—") + "</td><td>" +
+            fmtBytes(m.vramBytes) + "</td><td>" + (m.requestsServed ?? 0) + "</td></tr>").join("");
+    } catch (err) {
+      $("srv-updated").textContent = "failed to fetch /v1/server/status: " + err.message;
+      $("srv-updated").classList.add("err");
+    }
+  }
 
   async function refresh() {
     try {
@@ -147,13 +225,17 @@
     const btn = $("send"), reply = $("reply");
     const prompt = $("prompt").value.trim();
     if (!prompt) return;
+    if (!activeModelId) {
+      reply.textContent = "No model active — restart the server with --model-dir <dir> (or softwell serve <model>).";
+      return;
+    }
     btn.disabled = true;
     reply.textContent = "Generating…";
     try {
       const res = await fetch("/v1/chat/completions", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: $("model").textContent.replace("model: ", "") || "softwell", messages: [{ role: "user", content: prompt }], stream: false }),
+        body: JSON.stringify({ model: activeModelId, messages: [{ role: "user", content: prompt }], stream: false }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error?.message || ("HTTP " + res.status));
@@ -166,7 +248,9 @@
   });
 
   refresh();
+  refreshServer();
   setInterval(refresh, 2000);
+  setInterval(refreshServer, 2000);
 </script>
 </body>
 </html>

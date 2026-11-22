@@ -3,25 +3,44 @@
  * src/cli.ts — `softwell` command line.
  *
  *   softwell up [--model-dir <dir>] [--workers N] [--port P] [--api-port A]
- *     Boot the orchestrator + N workers and wait. (v1: a model dir is
- *     required so workers have weights to load; defaults to the demo model
- *     when it exists.)
+ *     Boot the cluster + virtual server and wait. --model-dir is
+ *     optional: when given, that model is loaded and activated at boot;
+ *     otherwise the server starts with no active model, and a model
+ *     can be loaded later with POST /v1/models/load + /activate.
  *
  *   softwell run <model> [--workers N] [--port P] [--api-port A]
+ *   softwell serve <model> [--workers N] [--port P] [--api-port A]
  *     Boot the cluster, load <model> (a local directory, or a Hugging Face
  *     repo id like "meta-llama/Llama-3.3-70B-Instruct" which is downloaded
- *     first), and serve the OpenAI-compatible API + dashboard.
+ *     first), activate it and serve the OpenAI-compatible API + dashboard.
+ *     `run` and `serve` are the same command under two names.
+ *
+ *   softwell models [--api-port A]
+ *     List the models a running server knows about (HTTP client; no boot).
+ *
+ *   softwell stop [--api-port A]
+ *     Stop a running server: SIGTERM the pid in data/softwell.pid when it
+ *     is alive, otherwise POST /v1/server/shutdown on the API port.
  *
  *   softwell --help
  *
  * The CLI is the integration point: it owns the WorkerRegistry, the mesh
- * server, the shard plan, the scheduler (with a MeshClient transport), and
- * the API server. The virtual-hardware boot (hypervisor + pools) slots in
- * here once src/hw lands: pools are constructed over the same registry and
- * the model is staged vSSD -> vRAM before serving.
+ * server, the workers, the virtual-hardware boot (hypervisor + pools) and
+ * the ServingContextFactory that turns a ModelEntry into a running
+ * scheduler. The serving plane itself (ModelRegistry, VirtualServer, the
+ * HTTP API) lives in src/server/ and src/api/; this file only wires it.
+ *
+ * Reference-implementation note: workers open ONE weight loader from the
+ * --model-dir they are spawned with, and open a new loader on demand
+ * when an assignment names a different modelDir (see
+ * src/mesh/worker.ts `loaderFor`), so activating a different model
+ * re-plans and re-stages the workers without a restart. `softwell up`
+ * without --model-dir starts workers on the demo model directory when
+ * it exists. See docs/SERVER.md.
  */
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
+import type { Server } from "node:http";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,13 +48,15 @@ import {
   DEFAULT_ORCHESTRATOR_PORT,
   type ClusterSnapshot,
   type EngineOptions,
-  type ExecuteResponse,
   type GeneratedToken,
+  type ModelEntry,
   type Scheduler,
+  type ServingContext,
   type ShardPlan,
+  type VirtualMachine,
 } from "./contracts.ts";
 import { describeEngineOptions, engineOptionsToFlags, parseEngineFlags } from "./engine/options.ts";
-import { openWeightLoader, loadManifest } from "./model/loader.ts";
+import { loadManifest } from "./model/loader.ts";
 import { loadTokenizer } from "./model/tokenizer.ts";
 import { downloadModel, resolveModelRef } from "./model/hub.ts";
 import { plan, replan } from "./planner/planner.ts";
@@ -43,21 +64,23 @@ import { WorkerRegistry } from "./mesh/registry.ts";
 import { createMeshServer, MeshClient } from "./mesh/protocol.ts";
 import { ContinuousBatchingScheduler } from "./scheduler/batch.ts";
 import { sampleLogits } from "./engine/sampling.ts";
-import { SoftwellServer } from "./api/server.ts";
+import { ModelRegistry } from "./server/registry.ts";
+import { VirtualServer } from "./server/server.ts";
+import type { ServingContextFactory } from "./server/server.ts";
 import { VirtualRam } from "./hw/vram.ts";
 import { VirtualGpu } from "./hw/vgpu.ts";
 import { VirtualCpu } from "./hw/vcpu.ts";
 import { VirtualSsd } from "./hw/vssd.ts";
 import { Hypervisor } from "./hw/hypervisor.ts";
-import type { VirtualMachine } from "./contracts.ts";
 
 const WORKER_ENTRY = fileURLToPath(new URL("./mesh/worker.ts", import.meta.url));
 const DEMO_MODEL_DIR = fileURLToPath(new URL("../demo/models/demo-10m", import.meta.url));
+const PIDFILE = fileURLToPath(new URL("../data/softwell.pid", import.meta.url));
 const DEFAULT_API_PORT = 8420;
 const DEFAULT_WORKERS = 2;
 
-interface CliOptions {
-  command: "up" | "run" | "help";
+export interface CliOptions {
+  command: "up" | "run" | "serve" | "models" | "stop" | "help";
   modelRef?: string;
   modelDir?: string;
   workers: number;
@@ -76,10 +99,22 @@ function printHelp(): void {
 Usage:
   softwell up [--model-dir <dir>] [--workers N] [--port P] [--api-port A]
   softwell run <model> [--workers N] [--port P] [--api-port A]
+  softwell serve <model> [--workers N] [--port P] [--api-port A]
+  softwell models [--api-port A]
+  softwell stop [--api-port A]
   softwell --help
 
   <model> is a local directory or a Hugging Face repo id
   (e.g. meta-llama/Llama-3.3-70B-Instruct).
+
+  up starts the cluster and the virtual server. With --model-dir the
+  model is loaded and activated at boot; without it the server starts
+  with no model active, and a model can be loaded later with
+  POST /v1/models/load followed by POST /v1/models/:id/activate
+  (or start with --model-dir, or use run / serve.)
+  run and serve are the same: boot, load <model>, activate it and serve
+  until stopped. models lists what a running server knows about;
+  stop shuts a running server down (pidfile first, API fallback).
 
   Novel engine paths (all default to the baseline behaviour):
     --attention exact|landmark|sparse   attention (Theorems A1/A2)
@@ -90,10 +125,10 @@ Usage:
     --draft-length K                    draft length / Jacobi block size (default 4)
 
 Defaults: --workers ${DEFAULT_WORKERS}, --port ${DEFAULT_ORCHESTRATOR_PORT}, --api-port ${DEFAULT_API_PORT}.
-The demo model (demo/models/demo-10m) is used when no model is given and it exists.`);
+The demo model (demo/models/demo-10m) is used for workers when no model is given and it exists.`);
 }
 
-function parseArgs(argv: string[]): CliOptions {
+export function parseArgs(argv: string[]): CliOptions {
   const { options: engineOptions, rest: argvRest } = parseEngineFlags(argv);
   const opts: CliOptions = {
     command: "help",
@@ -107,6 +142,9 @@ function parseArgs(argv: string[]): CliOptions {
     const a = argvRest[i] as string;
     if (a === "up") opts.command = "up";
     else if (a === "run") opts.command = "run";
+    else if (a === "serve") opts.command = "serve";
+    else if (a === "models") opts.command = "models";
+    else if (a === "stop") opts.command = "stop";
     else if (a === "--help" || a === "-h") opts.command = "help";
     else if (a === "--workers") opts.workers = Number(argvRest[++i]);
     else if (a === "--port") opts.port = Number(argvRest[++i]);
@@ -116,8 +154,8 @@ function parseArgs(argv: string[]): CliOptions {
     else if (a.startsWith("--")) throw new Error(`unknown flag: ${a}`);
     else rest.push(a);
   }
-  if (opts.command === "run") {
-    if (rest.length === 0) throw new Error("softwell run needs a <model> argument");
+  if (opts.command === "run" || opts.command === "serve") {
+    if (rest.length === 0) throw new Error(`softwell ${opts.command} needs a <model> argument`);
     opts.modelRef = rest[0];
   }
   return opts;
@@ -147,11 +185,19 @@ class InstrumentedScheduler implements Scheduler {
   getSequence(id: string) {
     return this.inner.getSequence(id);
   }
+  cancel(id: string): boolean {
+    return this.inner.cancel(id);
+  }
   pendingCount(): number {
     return this.inner.pendingCount();
   }
   runningCount(): number {
     return this.inner.runningCount();
+  }
+  /** Swap in a new shard plan after a re-plan (delegates to the inner scheduler). */
+  updatePlan(plan: ShardPlan): void {
+    const inner = this.inner as Scheduler & { updatePlan?: (plan: ShardPlan) => void };
+    inner.updatePlan?.(plan);
   }
   avgLatencyMs(): number {
     if (this.latencies.length === 0) return 0;
@@ -160,6 +206,21 @@ class InstrumentedScheduler implements Scheduler {
   done(): number {
     return this.doneCount;
   }
+}
+
+/** Mutable pointer to whatever is currently serving, shared by the
+ *  factory (which sets it on activation), the cluster snapshot (which
+ *  reads it) and the sweep/re-plan loop (which updates the plan). */
+export interface ServingState {
+  modelId: string | null;
+  modelDir: string | null;
+  plan: ShardPlan | null;
+  scheduler: InstrumentedScheduler | null;
+  inner: ContinuousBatchingScheduler | null;
+}
+
+function createServingState(): ServingState {
+  return { modelId: null, modelDir: null, plan: null, scheduler: null, inner: null };
 }
 
 async function resolveModelDir(opts: CliOptions): Promise<string> {
@@ -190,32 +251,40 @@ async function waitForWorkers(registry: WorkerRegistry, count: number, timeoutMs
   }
 }
 
-async function main(): Promise<void> {
-  let opts: CliOptions;
-  try {
-    opts = parseArgs(process.argv.slice(2));
-  } catch (err) {
-    console.error(`error: ${(err as Error).message}\n`);
-    printHelp();
-    process.exitCode = 2;
-    return;
-  }
-  if (opts.command === "help") {
-    printHelp();
-    return;
-  }
+// ---------------------------------------------------------------------------
+// Cluster boot
+// ---------------------------------------------------------------------------
 
-  const modelDir = await resolveModelDir(opts);
-  console.log(`softwell: loading model from ${modelDir}`);
-  const manifest = loadManifest(modelDir, path.basename(modelDir));
-  const loader = openWeightLoader(modelDir);
-  void loader; // workers load their own shards from disk; the CLI only needs the manifest
-  const tokenizer = loadTokenizer(modelDir);
-  console.log(
-    `softwell: ${manifest.modelId} — ${(manifest.totalParams / 1e6).toFixed(1)}M params, ` +
-      `${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MB, ${manifest.config.numHiddenLayers} layers`,
-  );
-  console.log(`softwell: engine: ${describeEngineOptions(opts.engineOptions)}`);
+export interface BootClusterOptions {
+  workers: number;
+  port: number;
+  memoryBytes?: number;
+  engineOptions: EngineOptions;
+  /** Local model directory workers load weights from at spawn. Workers
+   *  open one weight loader at startup, so this pins what they can serve;
+   *  it is NOT the active model — activation happens later, through the
+   *  factory, and must name a model from this directory. */
+  workerModelDir: string;
+}
+
+export interface BootedCluster {
+  registry: WorkerRegistry;
+  meshServer: Server;
+  children: ChildProcess[];
+  hypervisor: Hypervisor;
+  vm: VirtualMachine;
+  servingState: ServingState;
+  getCluster: () => ClusterSnapshot;
+}
+
+/**
+ * Boot the cluster without any model: WorkerRegistry + mesh server +
+ * N workers + waitForWorkers + Hypervisor boot (pools over the registry).
+ * The virtual machine is up at the end; no model is loaded or active.
+ */
+export async function bootCluster(opts: BootClusterOptions): Promise<BootedCluster> {
+  const servingState = createServingState();
+  const startedAt = Date.now();
 
   // --- Orchestrator: mesh registry + mesh server ---------------------------
   const registry = new WorkerRegistry();
@@ -241,7 +310,7 @@ async function main(): Promise<void> {
         "--orchestrator",
         orchestratorUrl,
         "--model-dir",
-        modelDir,
+        opts.workerModelDir,
         "--port",
         "0",
         ...engineFlags,
@@ -277,110 +346,293 @@ async function main(): Promise<void> {
       `vCPU ${vmInfo.cpu.totalCores} cores, vSSD ${(vmInfo.ssd.totalBytes / 1024 ** 3).toFixed(1)} GiB`,
   );
 
-  // --- Stage the model: local files -> vSSD -> vRAM -------------------------
-  // Weights live on the virtual SSD and stream up into pooled vRAM; the
-  // vGPU reads tensors from vRAM by virtual address.
-  const modelFiles = fs
-    .readdirSync(modelDir)
-    .filter((f) => f.endsWith(".json") || f.endsWith(".safetensors"))
-    .sort();
-  for (const file of modelFiles) {
-    const bytes = fs.readFileSync(path.join(modelDir, file));
-    await vm.ssd.putObject(`models/${manifest.modelId}/${file}`, bytes);
-  }
-  console.log(`softwell: staged ${modelFiles.length} model file(s) on vSSD`);
-  const weightKey = `models/${manifest.modelId}/model.safetensors`;
-  const weightAlloc = await hypervisor.stageToVram(weightKey);
-  gpu.registerAllocation(weightAlloc);
-  console.log(
-    `softwell: weights streamed vSSD -> vRAM (${(weightAlloc.sizeBytes / 1024 / 1024).toFixed(1)} MB ` +
-      `in ${weightAlloc.pages.length} page(s) at vaddr 0x${weightAlloc.vaddr.toString(16)})`,
-  );
+  const getCluster = (): ClusterSnapshot => {
+    const scheduler = servingState.scheduler;
+    return {
+      modelId: servingState.modelId,
+      plan: servingState.plan,
+      workers: registry.listWorkers(),
+      sequences: {
+        waiting: scheduler?.pendingCount() ?? 0,
+        running: scheduler?.runningCount() ?? 0,
+        done: scheduler?.done() ?? 0,
+      },
+      tokensPerSec: registry.listWorkers().reduce((n, w) => n + registry.workerThroughput(w.workerId), 0),
+      avgLatencyMs: scheduler?.avgLatencyMs() ?? 0,
+      uptimeSec: (Date.now() - startedAt) / 1000,
+      vm: vm.info(),
+    };
+  };
 
-  // --- Shard plan -----------------------------------------------------------
-  const workers = registry.listWorkers();
-  let shardPlan: ShardPlan = plan({ manifest, workers });
-  if ("feasible" in shardPlan && shardPlan.feasible === false) {
-    throw new Error(`no feasible shard plan: ${(shardPlan as { reason?: string }).reason ?? "unknown"}`);
-  }
-  registry.setAssignment(shardPlan);
-  console.log(
-    `softwell: plan — ${shardPlan.pipelineStages} pipeline stage(s), ` +
-      `est. ${shardPlan.estimatedTokensPerSec.toFixed(1)} tok/s (${shardPlan.bottleneck})`,
-  );
+  return { registry, meshServer, children, hypervisor, vm, servingState, getCluster };
+}
 
-  // --- Scheduler ------------------------------------------------------------
-  // Novel decoding mode (speculative/Jacobi) is a scheduler option; the
-  // engine modes (attention/weights/KV) already went to the workers above.
+/**
+ * Build the ServingContextFactory for a VirtualServer. Given a loaded
+ * ModelEntry it reads the manifest, plans the model over the live workers
+ * (throwing the planner's reason when infeasible), stamps modelId +
+ * modelDir onto every assignment, installs the plan, and builds a
+ * ContinuousBatchingScheduler (MeshClient transport, sampleLogits,
+ * tokenizer decode, engine decoding options) wrapped in the
+ * InstrumentedScheduler. Workers load their own shards from the model
+ * directory; the CLI never opens a weight loader itself.
+ */
+export function buildFactory(
+  registry: WorkerRegistry,
+  opts: CliOptions,
+  servingState: ServingState,
+): ServingContextFactory {
   const client = new MeshClient({ timeoutMs: 30_000 });
-  const schedulerInner = new ContinuousBatchingScheduler({
-    plan: shardPlan,
-    transport: async (workerId, req) => {
-      const w = registry.getWorker(workerId);
-      if (!w) throw new Error(`unknown worker ${workerId}`);
-      return client.execute(`http://${w.host}:${w.port}`, { ...req, workerId });
+  return {
+    async build(entry: ModelEntry): Promise<ServingContext> {
+      const manifest = loadManifest(entry.dir, entry.id);
+      const tokenizer = loadTokenizer(entry.dir);
+      console.log(
+        `softwell: ${manifest.modelId} — ${(manifest.totalParams / 1e6).toFixed(1)}M params, ` +
+          `${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MB, ${manifest.config.numHiddenLayers} layers`,
+      );
+      const workers = registry.listWorkers();
+      const planned = plan({ manifest, workers });
+      if (!planned.feasible) {
+        throw new Error(`no feasible shard plan: ${planned.reason ?? "unknown"}`);
+      }
+      const stamped: ShardPlan = {
+        ...planned,
+        assignments: planned.assignments.map((a) => ({ ...a, modelId: entry.id, modelDir: entry.dir })),
+      };
+      registry.setAssignment(stamped);
+      console.log(
+        `softwell: plan — ${stamped.pipelineStages} pipeline stage(s), ` +
+          `est. ${stamped.estimatedTokensPerSec.toFixed(1)} tok/s (${stamped.bottleneck})`,
+      );
+      // Novel decoding mode (speculative/Jacobi) is a scheduler option; the
+      // engine modes (attention/weights/KV) already went to the workers.
+      const inner = new ContinuousBatchingScheduler({
+        plan: stamped,
+        transport: async (workerId, req) => {
+          const w = registry.getWorker(workerId);
+          if (!w) throw new Error(`unknown worker ${workerId}`);
+          return client.execute(`http://${w.host}:${w.port}`, { ...req, workerId });
+        },
+        sampler: sampleLogits,
+        decode: (ids) => tokenizer.decode(ids),
+        eosTokenId: manifest.config.eosTokenId,
+        rolesByWorker: Object.fromEntries(workers.map((w) => [w.workerId, w.roles])),
+        decoding: opts.engineOptions.decoding,
+        draftLength: opts.engineOptions.draftLength,
+      });
+      const scheduler = new InstrumentedScheduler(inner);
+      servingState.modelId = entry.id;
+      servingState.modelDir = entry.dir;
+      servingState.plan = stamped;
+      servingState.scheduler = scheduler;
+      servingState.inner = inner;
+      return { modelId: entry.id, scheduler, tokenizer, manifest };
     },
-    sampler: sampleLogits,
-    decode: (ids) => tokenizer.decode(ids),
-    eosTokenId: manifest.config.eosTokenId,
-    rolesByWorker: Object.fromEntries(workers.map((w) => [w.workerId, w.roles])),
-    decoding: opts.engineOptions.decoding,
-    draftLength: opts.engineOptions.draftLength,
-  });
-  const scheduler = new InstrumentedScheduler(schedulerInner);
+    async dispose(ctx: ServingContext): Promise<void> {
+      // Nothing to tear down for the scheduler itself: the next activation
+      // re-plans and builds a fresh one. Only drop the CLI's pointer to
+      // this context so the cluster snapshot and the re-plan loop stop
+      // reporting it once it is gone.
+      if (servingState.scheduler === ctx.scheduler) {
+        servingState.modelId = null;
+        servingState.modelDir = null;
+        servingState.plan = null;
+        servingState.scheduler = null;
+        servingState.inner = null;
+      }
+    },
+  };
+}
 
-  // --- API server -----------------------------------------------------------
-  const startedAt = Date.now();
-  const getCluster = (): ClusterSnapshot => ({
-    modelId: manifest.modelId,
-    plan: shardPlan,
-    workers: registry.listWorkers(),
-    sequences: {
-      waiting: scheduler.pendingCount(),
-      running: scheduler.runningCount(),
-      done: scheduler.done(),
-    },
-    tokensPerSec: registry.listWorkers().reduce((n, w) => n + registry.workerThroughput(w.workerId), 0),
-    avgLatencyMs: scheduler.avgLatencyMs(),
-    uptimeSec: (Date.now() - startedAt) / 1000,
-    vm: vm.info(),
+// ---------------------------------------------------------------------------
+// Pidfile (data/softwell.pid) — lets `softwell stop` find this process.
+// ---------------------------------------------------------------------------
+
+function writePidfile(): void {
+  fs.mkdirSync(path.dirname(PIDFILE), { recursive: true });
+  fs.writeFileSync(PIDFILE, `${process.pid}\n`, "utf-8");
+}
+
+function removePidfile(): void {
+  try {
+    fs.rmSync(PIDFILE, { force: true });
+  } catch {
+    // Best-effort: a missing pidfile is not an error.
+  }
+}
+
+function readPidfile(): number | null {
+  try {
+    const raw = fs.readFileSync(PIDFILE, "utf-8").trim();
+    const pid = Number(raw);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // ESRCH: no such process. EPERM: a process exists but we may not
+    // signal it — treat as alive (SIGTERM below will report the error).
+    return code !== "ESRCH";
+  }
+}
+
+async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const started = Date.now();
+  for (;;) {
+    if (!isPidAlive(pid)) return true;
+    if (Date.now() - started > timeoutMs) return false;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Serve: bootCluster + ModelRegistry + VirtualServer, then serve forever.
+// ---------------------------------------------------------------------------
+
+/**
+ * Boot the cluster and the virtual server, optionally load + activate one
+ * model at boot, then serve until shutdown (SIGINT/SIGTERM or the API
+ * shutdown endpoint). Returns only on fatal setup errors — once serving,
+ * the process stays alive on its listening servers.
+ */
+async function serveCluster(opts: CliOptions, bootModelDir: string | undefined): Promise<void> {
+  // Workers open one weight loader at spawn, so they need a model
+  // directory even when no model is active yet. The demo model is the
+  // fallback; without it the caller must name a directory.
+  let workerModelDir: string;
+  if (bootModelDir !== undefined) {
+    workerModelDir = bootModelDir;
+  } else if (fs.existsSync(DEMO_MODEL_DIR)) {
+    workerModelDir = DEMO_MODEL_DIR;
+    console.log(
+      `softwell: no --model-dir given; workers start with the demo model directory (${DEMO_MODEL_DIR})`,
+    );
+  } else {
+    throw new Error(
+      "no model directory for workers: pass --model-dir <dir> or run `npm run make-demo-model` so the demo model exists",
+    );
+  }
+  if (bootModelDir !== undefined) {
+    console.log(`softwell: loading model from ${bootModelDir}`);
+  }
+
+  const cluster = await bootCluster({
+    workers: opts.workers,
+    port: opts.port,
+    memoryBytes: opts.memoryBytes,
+    engineOptions: opts.engineOptions,
+    workerModelDir,
   });
-  const api = new SoftwellServer({
-    scheduler,
-    tokenizer,
-    modelId: manifest.modelId,
+  const { registry, meshServer, children, hypervisor, vm, servingState, getCluster } = cluster;
+  const factory = buildFactory(registry, opts, servingState);
+
+  let server: VirtualServer | null = null;
+  let shuttingDown = false;
+  let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log("\nsoftwell: shutting down...");
+    if (sweepTimer !== undefined) clearInterval(sweepTimer);
+    await hypervisor.shutdown().catch(() => undefined);
+    await server?.close().catch(() => undefined);
+    await new Promise<void>((resolve) => meshServer.close(() => resolve()));
+    for (const child of children) child.kill("SIGTERM");
+    removePidfile();
+    process.exit(0);
+  };
+
+  const modelRegistry = new ModelRegistry({
+    vm: () => vm,
+    stageToVram: (key: string) => hypervisor.stageToVram(key),
+    isActive: (id: string) => server?.getActive()?.modelId === id,
+    modelsDir: path.resolve("models"),
+  });
+  server = new VirtualServer({
+    registry: modelRegistry,
+    factory,
+    options: { port: opts.apiPort, engineOptions: opts.engineOptions },
     getCluster,
-    port: opts.apiPort,
+    onShutdown: () => void shutdown(),
   });
-  const apiPort = await api.start();
-  console.log(`softwell: API on http://127.0.0.1:${apiPort}  (dashboard at /)`);
-  console.log(`softwell: try: curl -s http://127.0.0.1:${apiPort}/v1/models`);
-  console.log(`softwell: serving ${manifest.modelId} — press Ctrl-C to stop`);
+  // Load + activate the boot model BEFORE starting the API server, so
+  // the API only opens once the model is actually serving (the demo and
+  // clients treat "the API answers" as "ready to generate"). The
+  // registry only needs the booted VM, not a booted server. `up` without
+  // a model skips this and boots with nothing active.
+  let bootEntry: ModelEntry | null = null;
+  if (bootModelDir !== undefined) {
+    bootEntry = await server.loadModel(bootModelDir);
+    await server.activateModel(bootEntry.id);
+  }
+  await server.boot(vm);
+  writePidfile();
+
+  const actualApiPort = server.getApiPort() ?? opts.apiPort;
+  console.log(`softwell: API on http://127.0.0.1:${actualApiPort}  (dashboard at /)`);
+  console.log(`softwell: try: curl -s http://127.0.0.1:${actualApiPort}/v1/models`);
+
+  if (bootEntry !== null) {
+    console.log(`softwell: serving ${bootEntry.id} — press Ctrl-C to stop`);
+  } else {
+    console.log(
+      "softwell: no model active — load one with POST /v1/models/load then " +
+        "POST /v1/models/:id/activate, or restart with --model-dir <dir> " +
+        "(or `softwell serve <model>`)",
+    );
+  }
 
   // --- Fault detection: sweep heartbeats, re-shard on worker loss -----------
-  const sweepTimer = setInterval(() => {
+  // Only the ACTIVE model is re-planned; with no model active there is
+  // nothing to re-shard (a later activation plans over the survivors).
+  sweepTimer = setInterval(() => {
     const changed = registry.sweep();
     for (const w of changed) {
       console.log(`softwell: worker ${w.workerId} -> ${w.state}`);
     }
     const newlyDead = changed.filter((w) => w.state === "dead");
     if (newlyDead.length === 0) return;
+    const active = server?.getActive();
+    if (active === null || active === undefined) {
+      console.log("softwell: worker lost but no model is active — nothing to re-plan");
+      return;
+    }
+    const modelDir = servingState.modelDir;
+    const oldPlan = servingState.plan;
+    if (modelDir === null || oldPlan === null) {
+      console.log("softwell: worker lost but no shard plan is installed — nothing to re-plan");
+      return;
+    }
     const survivors = registry.listWorkers().filter((w) => w.state !== "dead");
     if (survivors.length === 0) {
       console.log("softwell: all workers lost — waiting for workers to rejoin");
       return;
     }
     try {
-      const newPlan = replan(manifest, survivors, shardPlan);
+      const newPlan = replan(active.manifest, survivors, oldPlan);
       if (!newPlan.feasible) {
         console.log(`softwell: re-plan infeasible: ${newPlan.reason ?? "unknown"}`);
         return;
       }
-      shardPlan = newPlan;
-      registry.setAssignment(newPlan);
-      schedulerInner.updatePlan(newPlan);
+      const stamped: ShardPlan = {
+        ...newPlan,
+        assignments: newPlan.assignments.map((a) => ({ ...a, modelId: active.modelId, modelDir })),
+      };
+      servingState.plan = stamped;
+      registry.setAssignment(stamped);
+      const scheduler = active.scheduler;
+      if (scheduler instanceof InstrumentedScheduler) scheduler.updatePlan(stamped);
+      else servingState.inner?.updatePlan(stamped);
       console.log(
-        `softwell: re-sharded over ${survivors.length} survivor(s), ${newPlan.pipelineStages} stage(s); ` +
+        `softwell: re-sharded over ${survivors.length} survivor(s), ${stamped.pipelineStages} stage(s); ` +
           `sequences running on the lost worker will error and must be resubmitted (their KV cache is gone)`,
       );
     } catch (err) {
@@ -389,24 +641,189 @@ async function main(): Promise<void> {
   }, 2000);
   sweepTimer.unref();
 
-  // --- Shutdown ---------------------------------------------------------------
-  let shuttingDown = false;
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log("\nsoftwell: shutting down...");
-    clearInterval(sweepTimer);
-    await hypervisor.shutdown().catch(() => undefined);
-    await api.close().catch(() => undefined);
-    await new Promise<void>((resolve) => meshServer.close(() => resolve()));
-    for (const child of children) child.kill("SIGTERM");
-    process.exit(0);
-  };
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
 }
 
-main().catch((err: unknown) => {
-  console.error(`softwell: fatal: ${err instanceof Error ? err.message : String(err)}`);
-  process.exit(1);
-});
+// ---------------------------------------------------------------------------
+// `softwell models` / `softwell stop` — HTTP clients, no boot.
+// ---------------------------------------------------------------------------
+
+interface ModelsListResponse {
+  data?: Array<{ id?: string }>;
+}
+
+interface ServerStatusResponse {
+  state?: string;
+  uptimeSec?: number;
+  activeModelId?: string | null;
+  models?: Array<{
+    id: string;
+    status: string;
+    params?: number;
+    weightBytes?: number;
+    vramBytes: number;
+    requestsServed?: number;
+  }>;
+}
+
+async function runModelsCommand(apiPort: number): Promise<void> {
+  const base = `http://127.0.0.1:${apiPort}`;
+  let models: ModelsListResponse;
+  try {
+    const res = await fetch(`${base}/v1/models`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    models = (await res.json()) as ModelsListResponse;
+  } catch {
+    console.error(`no softwell server reachable on port ${apiPort} — start one with \`softwell up\``);
+    process.exitCode = 1;
+    return;
+  }
+  // The rich per-model fields (status, params, weight/vRAM bytes) live on
+  // /v1/server/status; /v1/models only carries the ids. Fall back to the
+  // bare list when the status route is unavailable.
+  let status: ServerStatusResponse | null = null;
+  try {
+    const res = await fetch(`${base}/v1/server/status`);
+    if (res.ok) status = (await res.json()) as ServerStatusResponse;
+  } catch {
+    status = null;
+  }
+  const rows = (status?.models ?? []).map((m) => ({
+    id: m.id,
+    status: m.status,
+    paramsM: m.params !== undefined ? (m.params / 1e6).toFixed(1) : "—",
+    weightMB: m.weightBytes !== undefined ? (m.weightBytes / 1024 / 1024).toFixed(1) : "—",
+    vramMB: (m.vramBytes / 1024 / 1024).toFixed(1),
+    active: status?.activeModelId === m.id ? "*" : "",
+  }));
+  if (rows.length === 0) {
+    for (const m of models.data ?? []) {
+      if (typeof m.id === "string") {
+        rows.push({ id: m.id, status: "unknown", paramsM: "—", weightMB: "—", vramMB: "—", active: "" });
+      }
+    }
+  }
+  if (rows.length === 0) {
+    console.log("no models known to the server");
+  } else {
+    const pad = (s: string, n: number): string => s.padEnd(n);
+    console.log(
+      `${pad("id", 24)}${pad("status", 12)}${pad("params (M)", 12)}${pad("weight (MB)", 13)}${pad("vRAM (MB)", 11)}active`,
+    );
+    for (const r of rows) {
+      console.log(
+        `${pad(r.id, 24)}${pad(r.status, 12)}${pad(r.paramsM, 12)}${pad(r.weightMB, 13)}${pad(r.vramMB, 11)}${r.active}`,
+      );
+    }
+  }
+  if (status !== null) {
+    console.log(
+      status.activeModelId !== null && status.activeModelId !== undefined
+        ? `active model: ${status.activeModelId} (state: ${status.state ?? "?"}, uptime: ${Math.round(status.uptimeSec ?? 0)}s)`
+        : `no model active (state: ${status.state ?? "?"}, uptime: ${Math.round(status.uptimeSec ?? 0)}s)`,
+    );
+  }
+}
+
+async function runStopCommand(apiPort: number): Promise<void> {
+  const pid = readPidfile();
+  if (pid !== null) {
+    if (isPidAlive(pid)) {
+      console.log(`softwell: stopping pid ${pid}...`);
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch (err) {
+        console.error(`softwell: could not signal pid ${pid}: ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+      }
+      const exited = await waitForPidExit(pid, 10_000);
+      if (!exited) {
+        console.log(`softwell: pid ${pid} did not exit in 10s — SIGKILL`);
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        await waitForPidExit(pid, 2000);
+      }
+      removePidfile();
+      console.log(`softwell: stopped (pid ${pid})`);
+      process.exitCode = 0;
+      return;
+    }
+    // Stale pidfile: the pid is dead. Drop it and try the API instead.
+    console.log(`softwell: pidfile pointed at dead pid ${pid} — trying the API instead`);
+    removePidfile();
+  }
+  try {
+    const res = await fetch(`http://127.0.0.1:${apiPort}/v1/server/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    if (res.ok) {
+      console.log(`softwell: shutdown requested via the API on port ${apiPort}`);
+      process.exitCode = 0;
+      return;
+    }
+    console.error(`softwell: API shutdown failed: HTTP ${res.status}`);
+  } catch {
+    console.error(`no softwell server reachable on port ${apiPort} — nothing to stop (start one with \`softwell up\`)`);
+  }
+  process.exitCode = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  let opts: CliOptions;
+  try {
+    opts = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(`error: ${(err as Error).message}\n`);
+    printHelp();
+    process.exitCode = 2;
+    return;
+  }
+  if (opts.command === "help") {
+    printHelp();
+    return;
+  }
+  if (opts.command === "models") {
+    await runModelsCommand(opts.apiPort);
+    return;
+  }
+  if (opts.command === "stop") {
+    await runStopCommand(opts.apiPort);
+    return;
+  }
+  try {
+    if (opts.command === "up") {
+      const bootModelDir = opts.modelDir ? path.resolve(opts.modelDir) : undefined;
+      console.log(`softwell: engine: ${describeEngineOptions(opts.engineOptions)}`);
+      await serveCluster(opts, bootModelDir);
+    } else {
+      // run | serve: same path — boot, load the model, activate, serve.
+      const modelDir = await resolveModelDir(opts);
+      console.log(`softwell: engine: ${describeEngineOptions(opts.engineOptions)}`);
+      await serveCluster(opts, modelDir);
+    }
+  } catch (err) {
+    removePidfile();
+    console.error(`softwell: fatal: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 1;
+  }
+}
+
+// Run main() only when executed directly, not when imported (tests import
+// parseArgs from this module).
+const isMain =
+  process.argv[1] !== undefined &&
+  fileURLToPath(import.meta.url) === process.argv[1];
+if (isMain) {
+  void main();
+}

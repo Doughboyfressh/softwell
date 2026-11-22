@@ -89,7 +89,7 @@ function makeLoader(): WeightLoader {
   };
 }
 
-function makeCache(): PagedKVCache {
+function makeCache(_manifest: ModelManifest): PagedKVCache {
   return {
     blockSize: 16,
     allocate: () => [],

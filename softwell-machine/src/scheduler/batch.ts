@@ -224,6 +224,29 @@ export class ContinuousBatchingScheduler implements Scheduler {
     };
   }
 
+  /**
+   * Cancel a waiting or running sequence: it stops generating, its
+   * worker-side KV cache is freed (best-effort), and its state becomes
+   * "done" with finishReason "cancelled". Step-boundary semantics: a
+   * sequence already admitted to the step currently in flight may still
+   * have its forward run, but its logits are discarded and no further
+   * token is appended (see the guards in step() and appendToken()).
+   * Returns false for an unknown id or one already done/error. Never
+   * throws for an unknown id.
+   */
+  cancel(id: string): boolean {
+    const record = this.sequences.get(id);
+    if (record === undefined) return false;
+    const status = record.state.status;
+    if (status === "done" || status === "error") return false;
+    const waitingIndex = this.waitingOrder.indexOf(id);
+    if (waitingIndex >= 0) this.waitingOrder.splice(waitingIndex, 1);
+    record.state.status = "done";
+    record.state.finishReason = "cancelled";
+    void this.freeSequence(id).catch(() => undefined);
+    return true;
+  }
+
   pendingCount(): number {
     let count = 0;
     for (const record of this.sequences.values()) {
@@ -300,10 +323,13 @@ export class ContinuousBatchingScheduler implements Scheduler {
           for (const record of toPrefill) {
             const promptLen = record.state.promptTokenIds.length;
             const lastRow = row + promptLen - 1;
+            row += promptLen;
+            // A sequence cancelled while its prefill forward was in
+            // flight must not be resurrected: discard its logits.
+            if (record.state.status !== "prefill") continue;
             const vocab = logits.shape[1] as number;
             const rowLogits = new Float32Array(logits.data.slice(lastRow * vocab, (lastRow + 1) * vocab));
             const tokenId = this.sampler(rowLogits, record.request.sampling);
-            row += promptLen;
             record.state.status = "decoding";
             record.state.prefillDoneAt = Date.now();
             // Logits predicting the token after the first one: the starting
@@ -845,6 +871,9 @@ export class ContinuousBatchingScheduler implements Scheduler {
     produced: GeneratedToken[],
     info: SchedulerStepInfo,
   ): void {
+    // A sequence cancelled (or errored) while its forward was in flight
+    // must not gain another token: its logits are discarded.
+    if (record.state.status === "done" || record.state.status === "error") return;
     const state = record.state;
     state.generatedTokenIds.push(tokenId);
     const text = this.decodeText([tokenId]);

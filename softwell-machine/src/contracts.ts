@@ -322,6 +322,14 @@ export interface ShardAssignment {
   /** Expert-parallel: expert ids this worker owns (MoE only). */
   experts: number[];
   estimatedMemoryBytes: number;
+  /** Model this assignment serves. When it changes, the worker swaps its
+   *  weight loader to this model (see src/mesh/worker.ts). Absent on
+   *  assignments built before model switching existed. */
+  modelId?: string;
+  /** Local directory holding this model's files (same filesystem as the
+   *  worker in the reference implementation; multi-host model
+   *  distribution via vSSD is a documented follow-up). */
+  modelDir?: string;
 }
 
 export interface ShardPlan {
@@ -397,6 +405,13 @@ export interface Scheduler {
   getSequence(id: string): SequenceState | undefined;
   pendingCount(): number;
   runningCount(): number;
+  /**
+   * Cancel a waiting or running sequence: it stops generating, its
+   * worker-side KV cache is freed, and its state becomes "done" with
+   * finishReason "cancelled". Returns false when no such sequence exists
+   * (already done/error, or unknown id). Never throws for an unknown id.
+   */
+  cancel(id: string): boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,4 +697,184 @@ export interface VirtualMachine {
   cpu: IVirtualCpu;
   ssd: IVirtualSsd;
   info(): VirtualMachineInfo;
+}
+
+// ---------------------------------------------------------------------------
+// Virtual server — the serving plane that runs ON the virtual machine.
+//
+// The server is a workload of the VM, not a host-side sidecar: it boots
+// with the VM (see src/server/server.ts), reserves its memory from vRAM,
+// its stream from vGPU and its task handlers from vCPU through the
+// hypervisor, and serves models using only virtual hardware. Model weights
+// live on vSSD and are staged through vRAM; execution runs on the mesh
+// workers, which are the VM's donors. One model is ACTIVE at a time per
+// cluster (workers hold one weight loader); the registry may stage
+// several models, and activating another re-plans and reloads workers.
+// ---------------------------------------------------------------------------
+
+export type ModelEntryStatus = "available" | "loading" | "ready" | "error" | "unloading";
+
+/** One model known to the server, whether or not it is loaded. */
+export interface ModelEntry {
+  /** Model id (HF repo id or local directory basename). */
+  id: string;
+  /** Where the model came from. */
+  source: { kind: "local"; dir: string } | { kind: "hub"; repo: string };
+  /** Local directory holding the model files (after any HF download). */
+  dir: string;
+  status: ModelEntryStatus;
+  /** Human-readable error when status is "error". */
+  error?: string;
+  /** Manifest summary (present once the manifest has been read). */
+  params?: number;
+  weightBytes?: number;
+  numLayers?: number;
+  architectures?: string[];
+  /** Which tokenizer the model uses: "byte-level" (fallback) or "bpe"
+   *  (parsed from the model's tokenizer.json). */
+  tokenizerKind?: "byte-level" | "bpe";
+  /** vRAM held by this model's staged weights (0 when not staged). */
+  vramBytes: number;
+  /** Virtual address of the staged weights (undefined when not staged). */
+  weightVaddr?: VAddr;
+  loadedAt?: number;
+  requestsServed: number;
+  tokensGenerated: number;
+}
+
+export type ServerRequestStatus =
+  | "queued"
+  | "running"
+  | "done"
+  | "error"
+  | "cancelled"
+  | "rejected";
+
+/** One served request, for the request log and /v1/server/status. */
+export interface ServerRequestRecord {
+  id: string;
+  modelId: string;
+  endpoint: "/v1/chat/completions" | "/v1/completions";
+  startedAt: number;
+  endedAt?: number;
+  status: ServerRequestStatus;
+  promptTokens: number;
+  completionTokens: number;
+  /** ms from submit to first generated token (streaming + non-streaming). */
+  ttftMs?: number;
+  error?: string;
+}
+
+/** Live server status (GET /v1/server/status, dashboard). */
+export interface ServerStatus {
+  state: "starting" | "ready" | "degraded" | "stopping";
+  uptimeSec: number;
+  activeModelId: string | null;
+  models: ModelEntry[];
+  requests: {
+    active: number;
+    queued: number;
+    completed: number;
+    rejected: number;
+    cancelled: number;
+  };
+  /** Measured decode throughput across the active model (tokens/sec). */
+  tokensPerSec: number;
+  /** Waiting requests (scheduler waiting count). */
+  queueDepth: number;
+  vm: VirtualMachineInfo | null;
+  /** Last few request records (newest first). */
+  recentRequests: ServerRequestRecord[];
+}
+
+export interface HealthStatus {
+  status: "ok" | "degraded" | "down";
+  checks: {
+    vmBooted: boolean;
+    activeModel: boolean;
+    workersHealthy: boolean;
+  };
+}
+
+/** What the HTTP layer needs to serve one request. */
+export interface ServingContext {
+  modelId: string;
+  scheduler: Scheduler;
+  tokenizer: Tokenizer;
+  manifest: ModelManifest;
+}
+
+/**
+ * The HTTP layer's view of the server (implemented by VirtualServer in
+ * src/server/server.ts). The API layer never touches the registry, the
+ * hypervisor or the scheduler directly — only this interface.
+ */
+export interface ServingResolver {
+  /** Active serving context, or null when no model is active. */
+  getActive(): ServingContext | null;
+  /** All models the server knows about, as /v1/models entries. */
+  listModels(): ModelInfo[];
+  /** Live server status for /v1/server/status and the dashboard. */
+  getServerStatus(): ServerStatus;
+  /** Readiness: true when a model is active and workers are healthy. */
+  isReady(): boolean;
+  /** Health snapshot for /healthz. */
+  getHealth(): HealthStatus;
+  /** Request the server to shut down gracefully (admin endpoint). */
+  requestShutdown(): void;
+  /**
+   * Optional model management (implemented by VirtualServer; absent in
+   * the legacy fixed-model form and in minimal fakes, where the API
+   * answers 404). loadModel resolves a local directory, a loaded
+   * model id, or an HF repo id; a model that does not fit comes back
+   * as an entry with status "error" rather than throwing.
+   */
+  loadModel?(ref: string): Promise<ModelEntry>;
+  /** Unload a staged model. Throws for unknown ids and the active model. */
+  unloadModel?(id: string): Promise<void>;
+  /**
+   * Make a loaded ("ready") model the active one. Throws for unknown
+   * ids and models that are not ready.
+   */
+  activateModel?(id: string): Promise<ServingContext>;
+}
+
+/**
+ * Admission control + request accounting, implemented by VirtualServer.
+ * The API layer calls admit() before submitting and record() when a
+ * request ends; the server decides 429s, timeouts and cancellation.
+ */
+export interface AdmissionControl {
+  /** Called before a request is submitted. ok:false rejects the request. */
+  admit(modelId: string): { ok: true } | { ok: false; status: number; message: string };
+  /** Called when a request finishes, errors, or is cancelled. */
+  record(record: ServerRequestRecord): void;
+  counters(): {
+    active: number;
+    queued: number;
+    completed: number;
+    rejected: number;
+    cancelled: number;
+  };
+}
+
+/** Options for booting the virtual server. */
+export interface VirtualServerOptions {
+  /** HTTP port for the serving API (0 = ephemeral). */
+  port?: number;
+  /** Max waiting + running requests before new ones are rejected (429).
+   *  Default 32. */
+  maxQueue?: number;
+  /** Per-request deadline in ms; a request past it is cancelled.
+   *  Default 300_000. */
+  requestTimeoutMs?: number;
+  /** Max concurrently running sequences in the active model's scheduler.
+   *  Default 16. */
+  maxSequences?: number;
+  /** vRAM reserved for the server's own buffers (bytes). Default 256 MiB. */
+  serverMemoryBytes?: number;
+  /** Directory scanned for locally available models (default "./models"). */
+  modelsDir?: string;
+  /** Novel engine paths for loaded models (defaults to baseline). */
+  engineOptions?: EngineOptions;
 }
