@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>softwell — cluster dashboard</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e8eb; }
+  header { padding: 16px 24px; border-bottom: 1px solid #262a33; display: flex; gap: 16px; align-items: baseline; }
+  h1 { font-size: 20px; margin: 0; }
+  header span { color: #8b93a3; font-size: 13px; }
+  main { padding: 24px; max-width: 960px; margin: 0 auto; display: grid; gap: 20px; }
+  section { background: #171a21; border: 1px solid #262a33; border-radius: 10px; padding: 16px 20px; }
+  h2 { font-size: 15px; margin: 0 0 12px; color: #c8cdd8; }
+  .stats { display: flex; gap: 32px; flex-wrap: wrap; }
+  .stat b { display: block; font-size: 22px; }
+  .stat span { color: #8b93a3; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262a33; }
+  th { color: #8b93a3; font-weight: 600; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; background: #22303f; }
+  .pill.healthy { background: #173d2a; color: #7fd6a4; }
+  .pill.suspect { background: #4a3413; color: #f0c46c; }
+  .pill.dead { background: #4a1d1d; color: #f09393; }
+  textarea { width: 100%; min-height: 64px; background: #0f1115; color: #e6e8eb; border: 1px solid #333947; border-radius: 8px; padding: 10px; font: inherit; resize: vertical; }
+  button { margin-top: 10px; padding: 8px 18px; border: 0; border-radius: 8px; background: #4f7cff; color: #fff; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  pre { white-space: pre-wrap; word-break: break-word; background: #0f1115; border: 1px solid #262a33; border-radius: 8px; padding: 12px; margin: 12px 0 0; font-size: 13px; min-height: 40px; }
+  .muted { color: #8b93a3; font-size: 13px; }
+  .err { color: #f09393; }
+</style>
+</head>
+<body>
+<header>
+  <h1>softwell</h1>
+  <span id="model">model: —</span>
+  <span id="uptime">uptime: —</span>
+  <span id="updated" class="muted"></span>
+</header>
+<main>
+  <section>
+    <h2>Throughput</h2>
+    <div class="stats">
+      <div class="stat"><b id="tps">—</b><span>tokens / sec</span></div>
+      <div class="stat"><b id="latency">—</b><span>avg latency (ms)</span></div>
+      <div class="stat"><b id="seq-waiting">—</b><span>waiting</span></div>
+      <div class="stat"><b id="seq-running">—</b><span>running</span></div>
+      <div class="stat"><b id="seq-done">—</b><span>done</span></div>
+    </div>
+  </section>
+  <section>
+    <h2>Virtual machine</h2>
+    <div class="stats">
+      <div class="stat"><b id="vm-ram">—</b><span>vRAM pooled</span></div>
+      <div class="stat"><b id="vm-gpu">—</b><span>vGPU (TFLOP/s)</span></div>
+      <div class="stat"><b id="vm-cpu">—</b><span>vCPU cores</span></div>
+      <div class="stat"><b id="vm-ssd">—</b><span>vSSD objects</span></div>
+    </div>
+    <p id="vm-meta" class="muted">virtual machine not booted yet</p>
+  </section>
+  <section>
+    <h2>Workers</h2>
+    <table>
+      <thead><tr><th>id</th><th>device</th><th>state</th><th>memory used / free</th><th>roles</th><th>active seqs</th></tr></thead>
+      <tbody id="workers"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+    </table>
+  </section>
+  <section>
+    <h2>Shard placement</h2>
+    <table>
+      <thead><tr><th>stage</th><th>worker</th><th>layers</th><th>embedding</th><th>lm_head</th></tr></thead>
+      <tbody id="shards"><tr><td colspan="5" class="muted">no plan yet</td></tr></tbody>
+    </table>
+    <p id="plan-meta" class="muted"></p>
+  </section>
+  <section>
+    <h2>Try it</h2>
+    <textarea id="prompt" placeholder="Ask the model something…">Hello, what are you?</textarea>
+    <br>
+    <button id="send">Send</button>
+    <pre id="reply">Reply will appear here.</pre>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const fmtBytes = (n) => {
+    if (n == null) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v.toFixed(1) + " " + units[i];
+  };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  async function refresh() {
+    try {
+      const res = await fetch("/v1/cluster");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const snap = await res.json();
+      $("model").textContent = "model: " + (snap.modelId || "—");
+      $("uptime").textContent = "uptime: " + Math.round(snap.uptimeSec || 0) + "s";
+      $("tps").textContent = (snap.tokensPerSec ?? 0).toFixed(1);
+      $("latency").textContent = (snap.avgLatencyMs ?? 0).toFixed(1);
+      $("seq-waiting").textContent = snap.sequences?.waiting ?? 0;
+      $("seq-running").textContent = snap.sequences?.running ?? 0;
+      $("seq-done").textContent = snap.sequences?.done ?? 0;
+      $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+
+      const vm = snap.vm;
+      if (vm) {
+        $("vm-ram").textContent = fmtBytes(vm.vram?.usedBytes) + " / " + fmtBytes(vm.vram?.totalBytes);
+        $("vm-gpu").textContent = ((vm.gpu?.totalFlopsPerSec ?? 0) / 1e12).toFixed(1);
+        $("vm-cpu").textContent = vm.cpu?.totalCores ?? 0;
+        $("vm-ssd").textContent = (vm.ssd?.objects ?? 0) + " obj · " + fmtBytes(vm.ssd?.totalBytes);
+        $("vm-meta").textContent = (vm.nodes?.length ?? 0) + " donor node(s) · " +
+          (vm.gpu?.devices?.length ?? 0) + " virtual GPU device(s) · " +
+          (vm.gpu?.kernelsCompleted ?? 0) + " kernels completed";
+      }
+
+      const workers = snap.workers || [];
+      $("workers").innerHTML = workers.length === 0
+        ? '<tr><td colspan="6" class="muted">no workers registered</td></tr>'
+        : workers.map((w) => "<tr><td>" + esc(w.workerId) + "</td><td>" + esc(w.device) +
+            "</td><td><span class='pill " + esc(w.state) + "'>" + esc(w.state) + "</span></td><td>" +
+            fmtBytes(w.usedMemoryBytes) + " / " + fmtBytes(w.freeMemoryBytes) +
+            "</td><td>" + esc((w.roles || []).join(", ")) + "</td><td>" + (w.activeSequences ?? 0) + "</td></tr>").join("");
+
+      const plan = snap.plan;
+      if (plan && plan.assignments) {
+        $("shards").innerHTML = plan.assignments.map((a) => "<tr><td>" + a.stage + "</td><td>" +
+          esc(a.workerId) + "</td><td>" + a.layerStart + "–" + (a.layerEnd - 1) + "</td><td>" +
+          (a.hasEmbedding ? "yes" : "—") + "</td><td>" + (a.hasLmHead ? "yes" : "—") + "</td></tr>").join("");
+        $("plan-meta").textContent = plan.pipelineStages + " stages · est. " +
+          plan.estimatedTokensPerSec + " tok/s · TTFT ~" + plan.estimatedTtftMs + " ms · " + plan.bottleneck;
+      } else {
+        $("shards").innerHTML = '<tr><td colspan="5" class="muted">no plan yet</td></tr>';
+        $("plan-meta").textContent = "";
+      }
+    } catch (err) {
+      $("updated").textContent = "failed to fetch /v1/cluster: " + err.message;
+      $("updated").classList.add("err");
+    }
+  }
+
+  $("send").addEventListener("click", async () => {
+    const btn = $("send"), reply = $("reply");
+    const prompt = $("prompt").value.trim();
+    if (!prompt) return;
+    btn.disabled = true;
+    reply.textContent = "Generating…";
+    try {
+      const res = await fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: $("model").textContent.replace("model: ", "") || "softwell", messages: [{ role: "user", content: prompt }], stream: false }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || ("HTTP " + res.status));
+      reply.textContent = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
+    } catch (err) {
+      reply.textContent = "Error: " + err.message;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "bin": {
+    "softwell": "./src/cli.ts"
+  },
+  "description": "Softwell: a distributed inference machine for trillion-parameter open-weight LLMs. Reference implementation in TypeScript.",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "5.9"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "license": "MIT",
+  "name": "softwell-machine",
+  "private": true,
+  "scripts": {
+    "bench": "node src/bench/run.ts",
+    "demo": "node demo/run-demo.ts",
+    "make-demo-model": "node demo/make-demo-model.ts",
+    "start": "node src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
