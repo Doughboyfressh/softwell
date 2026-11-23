@@ -792,6 +792,30 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
     }
     const newlyDead = changed.filter((w) => w.state === "dead");
     if (newlyDead.length === 0) return;
+    // Orphaned-chunk reaper (docs/KV-DESIGN.md §7b): a dead worker's
+    // KV chunks are garbage the moment it dies — its sequences fail
+    // their next step and resubmit with fresh chunks — so free them
+    // now, before the re-plan, rather than leaking them until the
+    // orchestrator restarts. Best-effort and non-blocking: a reap
+    // failure is logged, never fatal. Runs even with no model active
+    // (chunks leak regardless of the model).
+    for (const w of newlyDead) {
+      void kvHandlers
+        .reapOwner(w.workerId)
+        .then((reaped) => {
+          if (reaped.freed > 0) {
+            console.log(
+              `softwell: reaped ${reaped.freed} orphaned KV chunk(s) ` +
+                `(${(reaped.bytes / 1024 / 1024).toFixed(1)} MiB) from dead worker ${w.workerId}`,
+            );
+          }
+        })
+        .catch((err) => {
+          console.log(
+            `softwell: failed to reap KV chunks from dead worker ${w.workerId}: ${(err as Error).message}`,
+          );
+        });
+    }
     const active = server?.getActive();
     if (active === null || active === undefined) {
       console.log("softwell: worker lost but no model is active — nothing to re-plan");

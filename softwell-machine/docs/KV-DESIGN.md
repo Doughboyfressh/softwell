@@ -674,6 +674,79 @@ are the refactor's own exit criteria; P4–P8 are integration criteria.
   — and is still the input to the later decision to flip the default
   (§5).
 
+## 7b. Robustness gaps, closed 2026-11-23 (workstream 3)
+
+- **(a) Binary activation transport — done.** POST /mesh/execute no
+  longer carries hidden states as JSON number arrays: the request and
+  the response are a framed header + raw float32 LE payload
+  (`[u32 LE header length][header JSON][float32 payload]`,
+  `src/mesh/protocol.ts`). Measured in
+  `test/binary-execute.test.ts`: a 64x128 tensor is 33,568 B binary
+  vs 155,860 B JSON (4.64x smaller), round-tripped bit-exact as
+  float32, tokenIds placeholder path intact, JSON requests still
+  accepted and answered with JSON, malformed frames rejected 400.
+  The worker handler and the scheduler are untouched — the framing
+  lives entirely in the protocol layer.
+- **(b) Chunk-table handover — resubmit is the contract, proven, not
+  built.** `test/kv-handover-resubmit.test.ts` pins it: flushed
+  chunk bytes survive a worker death (readable directly from vRAM),
+  but a fresh cache over the same access cannot read the dead
+  worker's sequence (VramKvError — the table is gone), and
+  re-prefilling the same tokens reproduces the KV bit-for-bit on
+  both layers. Why not build the handover: at production geometry
+  chunkTokens is 1024 (one 4 MiB page), so a sequence only flushes
+  past 1024 tokens — and only flushed chunks survive a death; the
+  staged tail is host memory, lost with the worker either way. In
+  the regime where vRAM KV is viable (short context), NOTHING is
+  ever flushed, so a handover would save exactly nothing. Above
+  1024 tokens it would save at most the flushed prefix while still
+  needing snapshot distribution before the death (a dead worker
+  cannot send its table), an attach protocol, block-id continuity,
+  and a tail re-prefill — for a regime that already costs +75%
+  decode. The scheduler already owns the resubmit path
+  (`batch.ts` updatePlan: sequences on a lost worker fail their
+  next step, marked "error", caller resubmits).
+- **(c) Orphaned-chunk reaper — done.** A crashing worker's chunks
+  used to leak forever (its table dies with it; nobody else knows
+  the alloc ids). Now every KV allocation through
+  POST /mesh/vram/alloc carries an owner tag (the worker id —
+  `RemoteVramAccess.setOwner`, called once the worker registers),
+  the orchestrator's KV handlers track id/owner/bytes, and
+  `reapOwner()` frees a dead worker's tagged allocations. The
+  CLI's fault-detection sweep calls it for every newly-dead worker,
+  before the re-plan, even with no model active. Proven in
+  `test/kv-reaper.test.ts` (handler level + wire level through a
+  real mesh server): reap frees exactly the dead owner's 2 allocs /
+  8 MiB, the survivor's bytes still read back, untagged allocs are
+  never reaped, reaping is idempotent, an explicit free untracks.
+  One crashed 1024-token sequence used to leak up to 12 layers x
+  4 MiB = 48 MiB per stage, unbounded across crashes. Caveats, both
+  documented in `src/server/vram-kv.ts`: reaping is safe only
+  because the resubmit contract owns the failure mode, and a worker
+  that revives after being declared dead must never be routed to
+  without a fresh stage load (its stale cache would read
+  reallocated addresses); sequence ids are never reused within a
+  stage lifetime — the same invariant `freeSequence` relies on.
+- **(d) Weight counters over HTTP — done.** Orchestrator side:
+  `GET /v1/server/status` now carries
+  `weights: { bytesServed }` (`ModelRegistry.weightBytesServed`).
+  Worker side: `GET /mesh/stats` returns the sums of that worker's
+  `VramWeightLoader`s' `tensorsFetched` / `bytesFetched` (disk
+  loaders contribute 0). Proven in `test/server.test.ts`,
+  `test/mesh.test.ts` (zeros for a disk-only worker, 404 on the
+  orchestrator), `test/vram-weights.test.ts` (live agreement with
+  the loader's own counters), and live in
+  `test/reactivation-disk-removed.test.ts`
+  (417,460,224 bytes served for demo-100m).
+- **(e) Activation re-activation proof — done.**
+  `test/reactivation-disk-removed.test.ts` (102 s, 2026-11-23):
+  demo-100m loaded + activated, directory renamed away,
+  re-activation succeeds (200, /readyz ok), generation streams
+  the same 8 tokens ("CCCCCCCC") as before the move, zero "using
+  disk weight loader" lines. This closes the follow-up DONOR.md
+  recorded: activation reads the manifest from the staged copy and
+  the tokenizer from staged vSSD, never from disk.
+
 ## 8. Risks and open questions for the integration workstream
 
 - The remote `VramAccess` transport (§1.4) is the largest remaining

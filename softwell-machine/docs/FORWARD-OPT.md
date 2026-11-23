@@ -6,6 +6,175 @@ SwiGLU, cached RoPE tables, in-place-softmax GQA, long-prompt bench,
 demo-100m) is deferred to follow-up. Nothing here changes any default,
 touches the scheduler/server/model code, or adds a physical backend.
 
+## Round 2 — top 3 hot spots beyond matmulTransposeB (2026-11-23)
+
+The core (u4 matmul) was already in place, so this round profiled again
+and optimized the next-biggest pieces. All three changes are in one file,
+`src/engine/attention.ts`; no call-site, default, scheduler, server, or
+model-code changes. Nothing pushed or merged.
+
+### What changed
+
+1. **Fused tiled SwiGLU** (`swiglu`, tile 256). For each tile of
+   intermediate units, the gate and up dots share one pass over x, the
+   silu*up product goes into a 256-float tile buffer, and the down
+   projection for the tile accumulates straight into the output. The
+   full gate/up/hidden arrays are never materialized. Also benefits
+   `moeForward`, which calls `swiglu` per expert.
+2. **GQA: u4 Q.K dot + in-place softmax** (`groupedQueryAttention`).
+   One scores array reused across heads and softmaxed in place (no
+   second weights array); the per-head dot uses the same 4-accumulator
+   unroll as `matmulTransposeB`. Masking semantics unchanged, including
+   the fully-masked query returning zeros.
+3. **Cached RoPE tables** (`applyRope` via `ropeRow`). cos/sin per
+   (theta, headDim, position) built lazily on first use, tables grown by
+   doubling; positions past 2^20 are computed on the fly so the cache
+   cannot grow without bound. Values identical to per-element
+   computation (max abs diff 6e-8, Float32 rounding).
+
+### Measured kernel gains (interleaved medians, load-cancelled)
+
+| Kernel | Before | After | Ratio |
+|---|---|---|---|
+| swiglu [576→1536] | 3.35–3.40 ms/call | 2.70–2.85 ms/call | **1.19–1.25x** |
+| GQA kvLen 21 | 52.1 µs/call | 40.9 µs/call | **1.13–1.16x** |
+| GQA kvLen 512 | 1127 µs/call | 973 µs/call | **1.19x** |
+| GQA kvLen 997 | 2246 µs/call | 1939 µs/call | **1.10x** |
+| RoPE 1 row/layer | 26.2 µs | 3.9 µs | **6.7x** |
+
+Re-measured rejections in the same runs: u8 unroll 0.92–1.05x vs u4,
+pre-transposed-weights T/T_u8 0.64–0.80x — both still rejected.
+The tiled SwiGLU re-associates the down accumulation across tiles:
+max abs diff vs the unfused version 7.6e-6 (tile 256; tile 128 was
+1.1e-5). GQA is bit-identical (maxdiff 0.0 at all kvLens).
+
+### End-to-end (SmolLM-135M, short prompt) — noisy, read with the caveat
+
+`scripts/bench-forward-opt.ts` before/after (full JSON in
+`forward-opt-bench-before.json` / `forward-opt-bench-after.json`;
+the core-phase before-file is backed up in `/tmp/fwd-opt-core-phase/`):
+
+| Metric (median) | Before | After run 1 | After run 2 |
+|---|---|---|---|
+| Generate, tok/s (3 reps) | 4.56 | 3.38 | 3.33 |
+| Decode-only, tok/s | 5.89 (169.7 ms) | 4.41 (227.0 ms) | 4.60 (217.2 ms) |
+| Prefill 5 tok, ms | 874 | 1219 | 1138 |
+| Long (221 tok) prefill, s | 51.9 | 69.7 | 54.0 |
+| Long decode median, ms | 386.5 | 273.4 | 254.3 |
+
+The absolute after numbers look worse because the host got much busier
+between the runs: loadavg 0.83 at the before run vs 4.41 / 1.61 at the
+after runs, with two sibling workstreams running concurrently. The
+before/after bench therefore does **not** measure the change — it
+measures the load. The honest end-to-end check is the alternating A/B
+in scratch trees under `/tmp/fwd-ab-old` (pre-change kernels) and
+`/tmp/fwd-ab-new` (current code), same minimal decode bench
+(24 single-row forwards, median ms), run old/new/old/new…:
+
+| Pair | Old | New | Ratio |
+|---|---|---|---|
+| 1 | 402.8 ms | 389.9 ms | 1.03x |
+| 2 | 413.4 ms | 371.2 ms | 1.11x |
+| 3 | 270.3 ms | 389.7 ms | 0.69x (load swung mid-pair: loadavg hit 6.0) |
+| 4 | 408.3 ms | 388.7 ms | 1.05x |
+
+Pooled medians: old ~405.5 ms vs new ~389.2 ms ≈ **1.04x**. Kernel math
+predicts ~1.10x on decode (swiglu 1.2x on ~57% of a decode token, GQA /
+RoPE negligible at short context), and the A/B is directionally
+consistent with that but too noisy to quote a clean end-to-end number.
+Do not quote the bench's 4.56 → 3.33 tok/s as a regression — it is a
+load artifact, contradicted by the interleaved kernel numbers and the
+A/B pairs.
+
+**Token identity: byte-for-byte.** The 16 generated tokens (and text
+`" Paris.\nThe capital of France is the capital of France.\nThe capital"`)
+are identical between the before and after bench runs, and the 24
+tokens from every A/B run (old and new trees) are identical.
+
+### Long context (997-token prompt)
+
+`scripts/profile-forward-997.ts` (fox sentence x100, 1001 tokens
+measured): prefill 317.2 s (316.9 ms/token) and decode median 306.6 ms
+→ 3.26 tok/s, text `" the. The. The. The."` — **new code only, under
+loadavg 5.69; there is no old-code run at 997 tokens, so this is a
+characterization, not a before/after.** The 221-token long decode in the
+bench needs a correction to the round-1 reading: its 8 samples declined
+steadily (420 → 191 ms), i.e. the 386 ms median caught a warmup/GC
+transient after the 52 s prefill; steady-state long decode is only
+~20–30 ms above short decode, consistent with the measured GQA
+(~15 ms/token at kvLen 221) + cache.read (~6 ms/token) — there is no
+unexplained 2x long-decode cost.
+
+`cache.read` at prefix 997 costs 0.27–0.33 ms/call (8–10 ms/token
+×30 layers) for 1.5 MB copied per call — near the memcpy floor, so a
+block-copy fast path inside `read()` was **not** done. The bigger
+long-context cost is allocation churn: every decode token allocates
+~10 MB of short-lived prefix copies at kvLen 221 (~45 MB at kvLen 997)
+plus per-layer intermediates, which is the likely GC pressure behind
+the transient above. Fixing it needs the deferred cache-interface
+change (zero-copy attention / `readAppend`), not a faster copy.
+
+### β / bandwidth-bound status — no direct β measurement
+
+β was **not** measured directly (no new β number is claimed). What was
+measured: a decode token moves ~536 MB of weights (134M params × 4 B)
+for ~268 MFLOP of work — arithmetic intensity 0.5 FLOP/byte — at
+~1.6 GFLOP/s effective, i.e. ~1.6–2.7 GB/s of weight streaming at
+3–5 tok/s. Host RAM bandwidth is far above that, so the forward is
+**scalar-execution-bound in JS** (per-operation / FP-latency cost),
+not RAM-bandwidth-bound: the binding constraint is what each scalar
+multiply-add costs, not the bytes moved. That is consistent with the
+quantized paths (vNPU INT8/FP8, SW-code) being slower in-process
+despite moving fewer bytes — shrinking bytes does not help wall-clock
+until the per-op cost drops. The three changes in this round reduce
+per-op and allocation overhead; none of them moves the backend toward
+bandwidth-bound, because bytes were never the binding constraint here.
+
+### Verification
+
+- `npx tsc --noEmit`: clean.
+- Targeted tests only (coordinator runs the full suite once at the
+  end): `test/forward-opt.test.ts` **20/20 pass** (10 matmul + 10 new:
+  fused SwiGLU vs serial reference at 3 shapes incl. odd/tile-remainder
+  sizes, GQA vs serial reference at kvLen 21/5/1 + fully-masked query,
+  RoPE cached vs per-element reference incl. positions 0/1/100/997/5000
+  and multi-row); `test/engine.test.ts` + `test/vnpu-kernels.test.ts`
+  pass; `test/novel-attention.test.ts` + `test/novel-numbers.test.ts`
+  **17/17 pass**. 39 tests total, 0 fail.
+- No push/merge. No change to defaults, scheduler, server, model, or
+  `docs/RESEARCH.md`.
+
+### Files
+
+- Changed: `src/engine/attention.ts` (swiglu, groupedQueryAttention,
+  applyRope/ropeRow only), `test/forward-opt.test.ts` (+10 tests),
+  `docs/FORWARD-OPT.md` (this section)
+- Added: `scripts/profile-forward-3.ts` (tiled-SwiGLU / GQA-u4 /
+  cache.read profilers), `scripts/profile-forward-997.ts` (long-context
+  characterization), `forward-opt-bench-before.json` /
+  `forward-opt-bench-after.json` (re-run for this round; core-phase
+  files backed up to `/tmp/fwd-opt-core-phase/`)
+- Scratch only (not in the tree): `/tmp/fwd-ab-old`, `/tmp/fwd-ab-new`
+  (alternating A/B trees; old tree has the three kernels reverted)
+
+### Not checked / deferred to follow-up
+
+- lm_head for last row only on prefill (21% of decode matmuls):
+  still needs a `ForwardContext` contract decision (speculative/Jacobi
+  verification reads every row's logits) — unchanged from round 1.
+- Zero-copy attention / cache `readAppend`: the real long-context fix
+  (kills the ~10–45 MB/token of prefix-copy allocation churn); needs a
+  cache-interface change, sequenced next if long context is the
+  priority.
+- Allocation churn in the forward loop generally (per-layer
+  intermediates: normed/q/k/v/attnOut/afterAttn/out arrays): unmeasured
+  as a separate item; buffer reuse would be a bigger, riskier refactor.
+- demo-100m in-process bench — not run this round.
+- A quiet-host end-to-end re-run: the A/B pairs above are the best
+  available while sibling workstreams share the host; re-run
+  `bench-forward-opt.ts` when the host is quiet for a cleaner headline
+  number.
+
 ## Profile: where a decode token goes (SmolLM-135M, in-process)
 
 SmolLM-135M: 30 layers, hidden 576, 9 heads / 3 KV heads, headDim 64,
@@ -118,22 +287,20 @@ measured under heavier load, so the two are not directly comparable.
 
 ## Not checked / deferred to follow-up
 
-- Long prompt (997-token) before/after — deferred; the O(n²)
-  attention + full-prefix cache read dominates there and is a
-  separate change.
+- Long prompt (997-token) before/after — partially done in round 2:
+  a 1001-token characterization run exists (`scripts/profile-forward-997.ts`,
+  317 s prefill / 3.26 tok/s decode under loadavg 5.69) but there is no
+  old-code run at that length, so it is not a before/after.
 - demo-100m in-process bench — deferred.
-- Fused SwiGLU (gate+up sharing one x pass): profiled at 2.24x vs
-  current `swiglu` (1.83x for u4 matmuls alone), i.e. ~1.2x on top of
-  this change. Next in line.
-- Cached RoPE cos/sin tables: profiled at 6.8x on `applyRope`
-  (27.2 → 4.0 µs/row/layer) but only ~0.3% of a short decode token;
-  worth doing for prefill, not for the headline.
-- In-place-softmax GQA (drop the per-head weights array): 1.17x at
-  kvLen 21, 1.05x at kvLen 512 — small, cheap, follow-up.
+- Fused SwiGLU, cached RoPE tables, in-place-softmax GQA: **done in
+  round 2** (see above) — 1.19–1.25x, 6.7x, 1.10–1.19x respectively.
 - lm_head for last row only: would save most of the 21% lm_head
   share on prefill, but needs a signal through `ForwardContext`
   (speculative/Jacobi verification reads every row's logits), so it
   is a contract decision, not a kernel tweak.
+- Zero-copy attention / cache `readAppend` and general allocation
+  churn: the remaining long-context work, sequenced as follow-up
+  (see round 2 section).
 
 ## Files
 

@@ -324,6 +324,8 @@ class FakeRegistry {
   /** Model id the registry currently treats as active (for unload refusal). */
   activeId: string | null = null;
   unloaded: string[] = [];
+  /** Orchestrator-side weight bytes served (mirrors the real registry). */
+  weightBytesServed = 0;
 
   listAvailable(): Promise<ModelEntry[]> {
     return Promise.resolve([...this.entries.values()]);
@@ -840,6 +842,16 @@ test("getServerStatus reports queueDepth from the active scheduler", async (t) =
   assert.equal(status.queueDepth, 3);
   assert.equal(status.activeModelId, "model-a");
   assert.equal(status.models.length, 3);
+});
+
+test("getServerStatus exposes the orchestrator weight counter", async (t) => {
+  const { registry, server } = makeHarness();
+  t.after(() => server.close());
+
+  // Default: nothing served yet.
+  assert.deepEqual(server.getServerStatus().weights, { bytesServed: 0 });
+  registry.weightBytesServed = 417_473_018;
+  assert.deepEqual(server.getServerStatus().weights, { bytesServed: 417_473_018 });
 });
 
 // ---------------------------------------------------------------------------

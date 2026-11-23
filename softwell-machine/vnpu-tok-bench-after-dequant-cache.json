@@ -1,0 +1,255 @@
+[
+  {
+    "timestamp": "2026-11-23T15:13:01.497Z",
+    "setting": "npu=off",
+    "npu": "off",
+    "model": "smollm-135m",
+    "prompt": "The capital of France is",
+    "promptTokens": 5,
+    "maxTokens": 16,
+    "reps": 1,
+    "decodeOnlyForwards": 8,
+    "prefillMs": [
+      1491
+    ],
+    "medianPrefillMs": 1491,
+    "generateRuns": [
+      {
+        "rep": 1,
+        "ms": 4773,
+        "tokPerSec": 3.35,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      }
+    ],
+    "medianGenerateTokPerSec": 3.35,
+    "decodeOnlyMs": [
+      223,
+      265,
+      221,
+      268,
+      233,
+      255,
+      244,
+      270
+    ],
+    "medianDecodeMs": 249.5,
+    "decodeOnlyTokPerSec": 4.01,
+    "loadSec": 1.7,
+    "npuStats": null,
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        0.73,
+        2.51,
+        2.06
+      ]
+    }
+  },
+  {
+    "timestamp": "2026-11-23T15:13:26.132Z",
+    "setting": "npu=int8",
+    "npu": "int8",
+    "model": "smollm-135m",
+    "prompt": "The capital of France is",
+    "promptTokens": 5,
+    "maxTokens": 16,
+    "reps": 1,
+    "decodeOnlyForwards": 8,
+    "prefillMs": [
+      2211
+    ],
+    "medianPrefillMs": 2211,
+    "generateRuns": [
+      {
+        "rep": 1,
+        "ms": 8104,
+        "tokPerSec": 1.97,
+        "tokens": [
+          7042,
+          30,
+          657,
+          314,
+          260,
+          3995,
+          2240,
+          281,
+          260,
+          905,
+          30,
+          657,
+          314,
+          260,
+          3575,
+          282
+        ],
+        "text": " Paris. It is the largest city in the world. It is the capital of"
+      }
+    ],
+    "medianGenerateTokPerSec": 1.97,
+    "decodeOnlyMs": [
+      399,
+      422,
+      402,
+      400,
+      406,
+      405,
+      387,
+      396
+    ],
+    "medianDecodeMs": 400.6,
+    "decodeOnlyTokPerSec": 2.5,
+    "loadSec": 8.5,
+    "npuStats": {
+      "devices": [
+        {
+          "nodeId": "local",
+          "device": "cpu",
+          "sramBytes": 268435456,
+          "sramUsedBytes": 135301936
+        }
+      ],
+      "sramCapacityBytes": 268435456,
+      "sramUsedBytes": 135301936,
+      "sramHits": 6926,
+      "sramMisses": 0,
+      "sramSpills": 0,
+      "sramEvictions": 0,
+      "int8Matmuls": 6926,
+      "fp8Matmuls": 0,
+      "swMatmuls": 0,
+      "bf16Matmuls": 0,
+      "attentionCalls": 0,
+      "kvQuantizeCalls": 0,
+      "opsCompleted": 6926,
+      "opsFailed": 0
+    },
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        0.69,
+        2.36,
+        2.02
+      ]
+    }
+  },
+  {
+    "timestamp": "2026-11-23T15:14:10.810Z",
+    "setting": "npu=fp8",
+    "npu": "fp8",
+    "model": "smollm-135m",
+    "prompt": "The capital of France is",
+    "promptTokens": 5,
+    "maxTokens": 16,
+    "reps": 1,
+    "decodeOnlyForwards": 8,
+    "prefillMs": [
+      1388
+    ],
+    "medianPrefillMs": 1388,
+    "generateRuns": [
+      {
+        "rep": 1,
+        "ms": 5692,
+        "tokPerSec": 2.81,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      }
+    ],
+    "medianGenerateTokPerSec": 2.81,
+    "decodeOnlyMs": [
+      304,
+      369,
+      324,
+      284,
+      284,
+      249,
+      279,
+      289
+    ],
+    "medianDecodeMs": 286.5,
+    "decodeOnlyTokPerSec": 3.49,
+    "loadSec": 33.4,
+    "npuStats": {
+      "devices": [
+        {
+          "nodeId": "local",
+          "device": "cpu",
+          "sramBytes": 268435456,
+          "sramUsedBytes": 134484092
+        }
+      ],
+      "sramCapacityBytes": 268435456,
+      "sramUsedBytes": 134484092,
+      "sramHits": 6926,
+      "sramMisses": 0,
+      "sramSpills": 0,
+      "sramEvictions": 0,
+      "int8Matmuls": 0,
+      "fp8Matmuls": 6926,
+      "swMatmuls": 0,
+      "bf16Matmuls": 0,
+      "attentionCalls": 0,
+      "kvQuantizeCalls": 0,
+      "opsCompleted": 6926,
+      "opsFailed": 0
+    },
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        0.33,
+        2.02,
+        1.92
+      ]
+    }
+  }
+]

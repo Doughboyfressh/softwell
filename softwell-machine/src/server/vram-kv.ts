@@ -80,15 +80,57 @@ function toMeshError(err: unknown, what: string): MeshError {
  *   readVram  -> GET  /mesh/vram/read?vaddr=...&length=... (bytes)
  *   writeVram -> POST /mesh/vram/write?vaddr=... (bytes in, JSON out)
  *   freeVram  -> POST /mesh/vram/free {id}
+ *   reapOwner -> (no route) free every allocation tagged with a dead
+ *     worker's id; called by the orchestrator's fault-detection sweep
+ *     (src/cli.ts), not over HTTP.
+ *   kvAllocStats -> (no route) tracked-allocation census, for tests
+ *     and (via /v1/server/status in future) observability.
  * No disk is involved on any of these paths; alloc rounds up to whole
  * 4 MiB pages inside VirtualRam, exactly as a local alloc would.
+ *
+ * Orphaned chunks (docs/KV-DESIGN.md §7b): a worker that crashes
+ * never frees its KV chunks — its chunk table dies with it and nobody
+ * else knows the alloc ids. These handlers therefore track every
+ * allocation made through POST /mesh/vram/alloc (id, owner tag, bytes
+ * actually reserved) and reapOwner() frees a dead worker's tagged
+ * allocations. Allocations made before owner tagging existed (or by
+ * clients that do not tag) are never reaped by owner. Reaping is safe
+ * because the resubmit contract already owns the failure mode: the
+ * dead worker's sequences fail their next step and are resubmitted
+ * with fresh chunks, so nothing live references a reaped id — except
+ * a worker that revives after being declared dead (a heartbeat
+ * revives it): its stale cache would read reallocated addresses, so
+ * the scheduler must never route to a revived worker without a fresh
+ * stage load, and sequence ids are never reused within a stage
+ * lifetime (the same invariant freeSequence already relies on).
  */
 export function createKvHandlers(ram: IVirtualRam): {
   allocVram: (req: VramAllocRequest) => Promise<VramAllocResponse>;
   readVram: (vaddr: number, length: number) => Promise<Uint8Array>;
   writeVram: (vaddr: number, data: Uint8Array) => Promise<VramWriteResponse>;
   freeVram: (id: string) => Promise<VramFreeResponse>;
+  /**
+   * Free every tracked allocation tagged with `owner` (a dead worker
+   * id). Best-effort per allocation: a free that fails keeps its
+   * entry (a later reap retries it) and is not counted. Returns the
+   * allocations actually freed and their bytes. Idempotent: reaping
+   * an owner with nothing tracked frees 0.
+   */
+  reapOwner: (owner: string) => Promise<{ freed: number; bytes: number }>;
+  /**
+   * Census of allocations tracked through these handlers: totals plus
+   * a per-owner breakdown (owner `null` = untagged). The tracked set
+   * covers only /mesh/vram/alloc allocations — weight staging goes
+   * through ram.alloc directly and is not tracked here.
+   */
+  kvAllocStats: () => {
+    allocations: number;
+    bytes: number;
+    byOwner: Array<{ owner: string | null; allocations: number; bytes: number }>;
+  };
 } {
+  /** allocId -> { owner tag (undefined = untagged), bytes reserved }. */
+  const tracked = new Map<string, { owner: string | undefined; sizeBytes: number }>();
   return {
     allocVram: async (req: VramAllocRequest): Promise<VramAllocResponse> => {
       try {
@@ -96,6 +138,7 @@ export function createKvHandlers(ram: IVirtualRam): {
           req.sizeBytes,
           req.replicas !== undefined ? { replicas: req.replicas } : undefined,
         );
+        tracked.set(alloc.id, { owner: req.owner, sizeBytes: alloc.sizeBytes });
         return { id: alloc.id, vaddr: alloc.vaddr, sizeBytes: alloc.sizeBytes };
       } catch (err) {
         throw toMeshError(err, `vRAM alloc of ${req.sizeBytes} bytes failed`);
@@ -129,10 +172,56 @@ export function createKvHandlers(ram: IVirtualRam): {
     freeVram: async (id: string): Promise<VramFreeResponse> => {
       try {
         await ram.free(id);
+        tracked.delete(id);
         return { freed: id };
       } catch (err) {
+        // An unknown id means the bytes are already gone: drop the
+        // stale tracking entry instead of keeping it forever.
+        if (err instanceof VramError && isNotFoundVramError(err)) tracked.delete(id);
         throw toMeshError(err, `vRAM free of allocation ${id} failed`);
       }
+    },
+
+    reapOwner: async (owner: string): Promise<{ freed: number; bytes: number }> => {
+      let freed = 0;
+      let bytes = 0;
+      for (const [id, entry] of [...tracked.entries()]) {
+        if (entry.owner !== owner) continue;
+        try {
+          await ram.free(id);
+        } catch {
+          // Best-effort: keep the entry so a later reap retries it.
+          continue;
+        }
+        tracked.delete(id);
+        freed += 1;
+        bytes += entry.sizeBytes;
+      }
+      return { freed, bytes };
+    },
+
+    kvAllocStats: (): {
+      allocations: number;
+      bytes: number;
+      byOwner: Array<{ owner: string | null; allocations: number; bytes: number }>;
+    } => {
+      const byOwner = new Map<string | null, { allocations: number; bytes: number }>();
+      let allocations = 0;
+      let bytes = 0;
+      for (const entry of tracked.values()) {
+        allocations += 1;
+        bytes += entry.sizeBytes;
+        const key = entry.owner ?? null;
+        const bucket = byOwner.get(key) ?? { allocations: 0, bytes: 0 };
+        bucket.allocations += 1;
+        bucket.bytes += entry.sizeBytes;
+        byOwner.set(key, bucket);
+      }
+      return {
+        allocations,
+        bytes,
+        byOwner: [...byOwner.entries()].map(([owner, counts]) => ({ owner, ...counts })),
+      };
     },
   };
 }

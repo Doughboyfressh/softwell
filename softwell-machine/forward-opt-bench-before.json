@@ -1,7 +1,7 @@
 {
   "label": "forward-opt-before",
   "phase": "before",
-  "timestamp": "2026-11-23T05:26:00.538Z",
+  "timestamp": "2026-11-23T14:58:56.700Z",
   "model": "smollm-135m",
   "params": 134015488,
   "host": {
@@ -11,11 +11,11 @@
     "cpus": 4,
     "cpuModel": "AMD EPYC 9D25 126-Core Processor",
     "totalMemMiB": 7934,
-    "freeMemMiB": 1069,
+    "freeMemMiB": 818,
     "loadavg": [
-      0.37,
-      1.5,
-      1.46
+      2.84,
+      1.06,
+      0.68
     ]
   },
   "short": {
@@ -23,16 +23,16 @@
     "promptTokens": 5,
     "maxTokens": 16,
     "prefillMs": [
-      3191,
-      3335,
-      3042
+      874,
+      850,
+      884
     ],
-    "medianPrefillMs": 3191,
+    "medianPrefillMs": 874,
     "generateRuns": [
       {
         "rep": 1,
-        "ms": 16133,
-        "tokPerSec": 0.99,
+        "ms": 3509,
+        "tokPerSec": 4.56,
         "tokens": [
           7042,
           30,
@@ -55,8 +55,8 @@
       },
       {
         "rep": 2,
-        "ms": 10983,
-        "tokPerSec": 1.46,
+        "ms": 3441,
+        "tokPerSec": 4.65,
         "tokens": [
           7042,
           30,
@@ -79,8 +79,8 @@
       },
       {
         "rep": 3,
-        "ms": 7708,
-        "tokPerSec": 2.08,
+        "ms": 3633,
+        "tokPerSec": 4.4,
         "tokens": [
           7042,
           30,
@@ -102,28 +102,49 @@
         "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
       }
     ],
-    "medianGenerateTokPerSec": 1.46,
+    "medianGenerateTokPerSec": 4.56,
     "tokenIdentityAcrossReps": true,
     "decodeOnlyMs": [
-      393,
-      411,
-      642,
-      900,
-      726,
-      683,
-      716,
-      798,
-      799,
-      894,
-      622,
-      664,
-      902,
-      687,
-      810,
-      741
+      169,
+      173,
+      186,
+      172,
+      176,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      170,
+      170,
+      169,
+      175,
+      174
     ],
-    "medianDecodeMs": 726,
-    "decodeOnlyTokPerSec": 1.38
+    "medianDecodeMs": 169.7,
+    "decodeOnlyTokPerSec": 5.89
   },
-  "long": null
+  "long": {
+    "promptConstruction": {
+      "sentence": "The quick brown fox jumps over the lazy dog. ",
+      "repeats": 22,
+      "chars": 990
+    },
+    "promptTokensMeasured": 221,
+    "reps": 1,
+    "prefillMs": 51869,
+    "decodeMs": [
+      420,
+      414,
+      397,
+      379,
+      386,
+      328,
+      281,
+      191
+    ],
+    "medianDecodeMs": 386.5,
+    "decodeTokPerSec": 2.59
+  }
 }

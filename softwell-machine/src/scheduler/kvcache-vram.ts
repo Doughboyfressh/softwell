@@ -133,8 +133,13 @@
  *     belong to which seq/layer), so a replacement worker cannot
  *     re-attach to flushed chunks even though their bytes survive in
  *     vRAM — it must resubmit. Proven by
- *     test/kvcache-vram-survival.test.ts; resuming would need a
- *     snapshot/attach handover that does not exist yet.
+ *     test/kvcache-vram-survival.test.ts and pinned as the contract
+ *     (with the quantitative case for not building a handover) in
+ *     test/kv-handover-resubmit.test.ts, docs/KV-DESIGN.md §7b.
+ *     A dead worker's chunks are freed by the orchestrator's
+ *     orphaned-chunk reaper (reapOwner, src/server/vram-kv.ts),
+ *     called from the fault-detection sweep — the crash path no
+ *     longer leaks them (test/kv-reaper.test.ts).
  *
  * Reads — coalesced per chunk, staging-aware:
  *   - Requested positions are grouped by chunk; consecutive positions
@@ -285,9 +290,14 @@ export class VirtualRamAccess implements VramAccess {
 
   async alloc(
     sizeBytes: number,
-    opts?: { replicas?: number },
+    opts?: { replicas?: number; owner?: string },
   ): Promise<{ id: string; vaddr: number }> {
-    const alloc = await this.ram.alloc(sizeBytes, opts);
+    // In-process: there is no orchestrator to tag for, so `owner`
+    // (the reaper tag) is ignored here; only RemoteVramAccess carries it.
+    const alloc = await this.ram.alloc(
+      sizeBytes,
+      opts?.replicas !== undefined ? { replicas: opts.replicas } : undefined,
+    );
     return { id: alloc.id, vaddr: alloc.vaddr };
   }
 

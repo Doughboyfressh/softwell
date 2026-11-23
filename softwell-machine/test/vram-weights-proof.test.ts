@@ -21,18 +21,22 @@
  *       generation still works afterwards.
  *
  * Notes on what is NOT asserted here, and why:
- * - The in-process counters (VramWeightLoader.tensorsFetched /
- *   bytesFetched, SafetensorsWeightLoader.bytesReadFromDisk,
- *   ModelRegistry.weightBytesServed) are not exposed on any HTTP
- *   endpoint, so this test cannot read them from outside the worker
- *   processes. It asserts the same fact behaviorally instead: with
- *   the directory renamed away, any disk read would throw, so
- *   successful generation *is* the zero-disk-read proof, and the
- *   worker log names the loader that was actually chosen.
- * - A re-activation after the move is NOT used as the re-load trigger:
- *   activation re-reads the manifest + tokenizer from the model
- *   directory on the orchestrator, so it cannot run with the dir gone.
- *   The worker-restart path above is the re-load trigger instead.
+ * - The in-process counters are now exposed on HTTP (2026-11-23,
+ *   workstream 3): `GET /v1/server/status` carries
+ *   `weights.bytesServed` (orchestrator side) and `GET /mesh/stats`
+ *   on a worker carries its `tensorsFetched` / `bytesFetched`
+ *   (SafetensorsWeightLoader.bytesReadFromDisk stays in-process
+ *   only). They are asserted live in
+ *   test/reactivation-disk-removed.test.ts and
+ *   test/vram-weights.test.ts; this test still asserts the same fact
+ *   behaviorally (successful generation with the directory gone *is*
+ *   the zero-disk-read proof), and the worker log names the loader
+ *   that was actually chosen.
+ * - A re-activation after the move IS now the re-load trigger in
+ *   test/reactivation-disk-removed.test.ts: activation takes the
+ *   manifest from the staged copy and the tokenizer from staged
+ *   vSSD, so it runs with the dir gone. This test keeps the
+ *   worker-restart path as its re-load trigger instead.
  * - Workers are spawned with --model-dir demo-10m (the `up` default),
  *   so the spawn-time loader is demo-10m; the demo-100m stage loader
  *   is chosen per-assignment by the worker (vRAM first, disk fallback).

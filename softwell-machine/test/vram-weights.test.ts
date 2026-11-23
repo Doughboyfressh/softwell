@@ -550,6 +550,13 @@ try {
     servedBeforeWorker + firstBytes100m.length,
     "orchestrator served exactly the fetched tensor's bytes from vRAM",
   );
+  // GET /mesh/stats on the worker exposes the same fetch, live: the
+  // worker-side counters must agree with the loader's own counters
+  // (and the orchestrator-side bytesServed above).
+  assert.deepEqual(await client.getStats(workerUrl), {
+    tensorsFetched: vramLoader.tensorsFetched,
+    bytesFetched: vramLoader.bytesFetched,
+  });
   assert.equal(
     spawnLoader.bytesReadFromDisk,
     0,
