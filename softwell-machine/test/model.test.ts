@@ -56,6 +56,58 @@ try {
   const reserialized = serializeSafetensorsHeader(header.tensors, header.metadata);
   assert.ok(reserialized.equals(raw.subarray(0, reserialized.length)));
 
+  // --- 1b. Canonical safetensors dtype codes (F32/F16/BF16/F8_E4M3).
+  // Real HF files use these, not the long names our writer used to emit:
+  // SmolLM-135M's model.safetensors is all F32 and used to fail here
+  // with `unsupported dtype F32`.
+  const canonicalHeader = Buffer.concat([
+    serializeSafetensorsHeader({
+      "w.f32": { dtype: "float32", shape: [2], dataOffsets: [0, 8] },
+      "w.f16": { dtype: "float16", shape: [2], dataOffsets: [8, 12] },
+      "w.bf16": { dtype: "bfloat16", shape: [2], dataOffsets: [12, 16] },
+      "w.f8": { dtype: "float8_e4m3", shape: [2], dataOffsets: [16, 18] },
+    }),
+    Buffer.alloc(18),
+  ]);
+  // The writer emits canonical codes, so a raw header built by hand with
+  // canonical codes parses to the same normalized tensor map.
+  const handBuilt = (() => {
+    const json = Buffer.from(
+      JSON.stringify({
+        "w.f32": { dtype: "F32", shape: [2], data_offsets: [0, 8] },
+        "w.f16": { dtype: "F16", shape: [2], data_offsets: [8, 12] },
+        "w.bf16": { dtype: "BF16", shape: [2], data_offsets: [12, 16] },
+        "w.f8": { dtype: "F8_E4M3", shape: [2], data_offsets: [16, 18] },
+      }),
+      "utf-8",
+    );
+    const out = Buffer.alloc(8 + json.length);
+    out.writeBigUInt64LE(BigInt(json.length), 0);
+    json.copy(out, 8);
+    return Buffer.concat([out, Buffer.alloc(18)]);
+  })();
+  const parsedCanonical = parseSafetensorsHeader(handBuilt);
+  assert.equal(parsedCanonical.tensors["w.f32"]?.dtype, "float32");
+  assert.equal(parsedCanonical.tensors["w.f16"]?.dtype, "float16");
+  assert.equal(parsedCanonical.tensors["w.bf16"]?.dtype, "bfloat16");
+  assert.equal(parsedCanonical.tensors["w.f8"]?.dtype, "float8_e4m3");
+  assert.deepEqual(parseSafetensorsHeader(canonicalHeader).tensors, parsedCanonical.tensors);
+  // The writer's bytes are canonical codes, not the long names.
+  assert.ok(canonicalHeader.subarray(8).toString("utf-8").includes('"F32"'));
+  assert.ok(!canonicalHeader.subarray(8).toString("utf-8").includes('"float32"'));
+  // Unknown codes still fail loudly.
+  const badHeader = (() => {
+    const json = Buffer.from(
+      JSON.stringify({ "w.bad": { dtype: "F64", shape: [1], data_offsets: [0, 8] } }),
+      "utf-8",
+    );
+    const out = Buffer.alloc(8 + json.length);
+    out.writeBigUInt64LE(BigInt(json.length), 0);
+    json.copy(out, 8);
+    return Buffer.concat([out, Buffer.alloc(8)]);
+  })();
+  assert.throws(() => parseSafetensorsHeader(badHeader), /unsupported dtype F64/);
+
   // --- 2. bfloat16 / float16 write + read round-trip (lossy, so tolerant). ---
   writeSafetensorsFile(path.join(modelDir, "model.safetensors"), [
     { name: "w.bf16", dtype: "bfloat16", shape: [4], data: new Float32Array([1.5, -2.25, 0.1, 100.0]) },

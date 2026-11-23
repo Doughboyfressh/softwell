@@ -1,0 +1,5 @@
+step 1/97 loss 10.8370 avg100 10.8370 191 tok/s elapsed 0.1m eta 8.6m
+step 25/97 loss 8.0695 avg100 9.3471 141 tok/s elapsed 3.0m eta 8.7m
+step 50/97 loss 6.6213 avg100 8.3150 121 tok/s elapsed 7.1m eta 6.6m
+step 75/97 loss 6.2955 avg100 7.6743 123 tok/s elapsed 10.4m eta 3.1m
+TRAIN DONE: 0.10M tokens, 97 steps, 11.9 min, final loss 6.2504, avg last100 7.3523, avg first100 7.3523

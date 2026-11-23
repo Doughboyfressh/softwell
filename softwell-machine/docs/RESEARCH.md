@@ -646,6 +646,40 @@ sw3 4.65×, sw4 3.60× vs BF16 (Gaussian); spike: 6.13×, 4.43×,
 mode because KV rows are short, so the 4-byte row offset costs
 4/headDim bytes per element on top of the block payload.
 
+**Perplexity on a real model (SmolLM-135M, TinyStories).** First
+real-model measurement (`scripts/bench-sw-smollm.ts`,
+`sw-smollm-bench.json`): 252 tokens, 4×64-token chunks teacher-forced
+from a 256 KiB slice at byte offset 1,000,000,000 of
+`training/data/TinyStories-train.txt` (322 complete stories in the
+slice; BOS prepended per chunk, fp32 KV throughout, identical tokens
+for every setting). Baseline (fp32 weights): mean NLL 3.862, PPL
+47.54. SW-code weights: sw4 mean NLL 4.164, PPL 64.32 (1.35× baseline,
++0.30 nats; worse on all 4 chunks, paired ΔNLL +0.46/+0.09/+0.28/+0.37);
+sw3 mean NLL 6.499, PPL 664.38 (14.0×); sw2 mean NLL 21.112, PPL
+1.47×10⁹ (31M×) — the model is destroyed, worse than uniform
+(ln 49152 ≈ 10.8), and its greedy continuation is gibberish
+(".academthon follows") where sw3 already degenerates to repetition
+(" the day the day"). The verdict is plain: **sw2 and sw3 weights are
+unusable, and even sw4 costs +35% perplexity** — the synthetic
+per-layer RMS errors (11%/25%/72%) understated the damage, because the
+error compounds over 30 layers and the lm_head is quantized too.
+SW-code weights need error compensation (GPTQ-style, §5.5) or a
+different operating point before they are viable as a weight format;
+sw4 is the only mode that still produces coherent text. Throughput on
+this backend moved the wrong way too: prefill 1.88 tok/s baseline vs
+0.59 (sw4), 1.01 (sw3), 1.02 (sw2); decode ~1.00 tok/s baseline vs
+0.73–0.75 for all three SW modes (4-token greedy sample; host
+contended, loadavg 1.3–2.9, so treat the absolute tok/s as noisy and
+the ratios as the signal). Weight bytes: 538 MB fp32 vs 189/172/156 MB
+(sw4/sw3/sw2); load including encode 3.1 s vs 52.8/15.4/14.6 s (sw4's
+52.8 s is partly first-run JIT and contention, not a mode cost).
+Caveats: 252 tokens only (SE of mean NLL ≈ 0.16–0.21 nats, so sw4's
++0.30 nats is ~1.5–2 SE — the direction is solid from the paired
+chunks, the exact ratio is not); chunks cut mid-story with BOS
+prepended, so the absolute PPL is slightly pessimistic while the
+paired comparison is fair. KV-cache perplexity impact is still
+unmeasured.
+
 **Reading the headline.** The 4–8× band versus BF16 is the SW3/SW2
 operating range (4.43–6.55× measured). SW4 alone is 3.47–3.60×
 versus BF16 — this is arithmetic, not a failure of the
@@ -691,8 +725,10 @@ of fp16) would save 1 byte per block but coarsens the step by up to
 **Limits.** The error bound is not a quality guarantee: the measured
 per-layer relative RMS errors (11% sw4, 25% sw3, 72% sw2 on synthetic
 weights) say sw2 weights would badly damage a model and sw3 is
-marginal, whatever the bound says. Measuring perplexity impact on a
-real model is future work. Theorem N2 is 30–60× loose. SW4 cannot
+marginal, whatever the bound says — and the real-model measurement
+(§5.4) is worse than that: sw4 +35% perplexity, sw3 14×, sw2
+destroyed. KV-cache perplexity impact on a real model is still
+unmeasured. Theorem N2 is 30–60× loose. SW4 cannot
 reach 4× vs BF16. KV row-offset overhead (4 bytes/row) costs 0.06
 B/elem at headDim 64. Row offsets are Uint32, so one packed tensor is
 capped at 4 GiB (~8B parameters at SW3). `matmulPackedAB` requires
@@ -739,13 +775,15 @@ sees target logits. (A4) One forward's cost is $1 + (R-1)\cdot\beta$
 for $R$ rows, with a single $\beta$ for the hardware at hand. (A5)
 Single sequence, batch size 1.
 
-**The drafter.** There is no separate draft model in this repo, so
-the drafter is built from what exists: the text itself. `NGramDrafter`
+**The drafter.** The default drafter is built from what exists: the
+text itself. `NGramDrafter`
 proposes the next token by finding the longest suffix of the context
 (up to 8 tokens) that has occurred before and copying the token that
 followed its most recent occurrence; if no suffix has occurred before,
 it repeats the last token. It costs O(K · 8 · |context|) integer
-comparisons — no forward pass, no weights, no training. It is
+comparisons — no forward pass, no weights, no training. A real draft
+model is also supported (`ModelDrafter`, `--draft-model <dir>`); it
+changes only the acceptance rate α, not the theorems. It is
 deliberately weak: it can only predict continuations that have
 already been seen, so its acceptance rate on a trained model
 generating varied text is expected to be low (single-digit percent is
@@ -898,6 +936,29 @@ the measurements confirm both lose. The actionable conclusion is not
 bandwidth-bound hardware (real GPUs serving large models, where decode
 is weight-streaming-bound and β ≈ 0) and/or a drafter with a high α
 on real text.
+
+**Measured with a real draft model (2026-11-22, `spec-draft-bench.json`).**
+Target SmolLM-135M (real trained model, 49152 vocab); draft a 17.3M
+Llama model trained on ~100k TinyStories tokens (final loss 6.25,
+top-1 next-token accuracy 7.56% — lightly trained, by design for this
+proof run). Single short run, prompt "The capital of France is",
+16 tokens, temp 0, K = 4, quiet host: baseline 3.45 tok/s (16 tokens
+in 4,634 ms, 16 forwards); speculative 0.89 tok/s (16 tokens in
+18,002 ms, 15 forwards, 69 rows, 14 rounds); **acceptance 2/16 =
+0.125**; draft ran 51 forwards. Tokens identical to the baseline
+(S1 exactness holds with a real drafter). β probe on the target:
+1-row forward 235 ms, 5-row 1,156 ms, β̂ ≈ 0.98. S1 predicts
+0.23× at α = 0.125, K = 4, β = 0.98 (E = 1.14 tokens/round over a
+cost of 4.92 forwards/round); measured **0.26×** — consistent.
+**Correction:** the wave-1 α̂ = 0.95 above is superseded — the first
+real acceptance on real text is 0.125, and it is low because the draft
+is lightly trained, not because the scheme is broken. But the β ≈ 1
+cap is the binding constraint: even at α = 1 this backend caps
+speculative speedup at ~1×, so a better-trained draft alone cannot
+make it win wall-clock here; it needs β < 1 (bandwidth-bound
+hardware) as well. Caveats: one run only (16 draft proposals, so α̂
+is noisy), short prompt only — no long-prompt bench was run for this
+report, and no medians.
 
 **Proof gaps.** (A2) is load-bearing and implementation-specific: if
 the cache ever stops overwriting on append, both schemes silently

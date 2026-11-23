@@ -644,15 +644,23 @@ are the refactor's own exit criteria; P4–P8 are integration criteria.
   (`test/kvcache-vram-survival.test.ts` donor-death e2e). Replicas=1
   loud rejection is cache-level only; the scheduler re-prefill on a
   replicas=1 read failure is the documented contract, not an e2e run.
-- **P7 — NOT met (no dedicated test).** What is known: the worker's
-  heartbeat is delayed by synchronous prefill chunks — the live
-  repros show repeated `-> suspect` trips (6 s silence) during long
-  prefills, but no `-> dead` trip and no re-plan in any run. The
-  async design means slow vRAM reads await (yielding the event loop)
-  rather than blocking it, so a slow `VramAccess` should not trip
-  heartbeats — but that is argued, not asserted by a test. The
-  specified test (long prefill against a 50 ms/read fake access,
-  heartbeats on schedule) still needs writing.
+- **P7 — met (dedicated test `test/heartbeat-p7.test.ts`, 4/4 pass,
+  2026-11-23).** Contract pinned: suspect after >6 s silence, dead
+  after >15 s (exact boundaries asserted), heartbeat revives
+  suspect/dead to healthy, and suspect alone never triggers a
+  re-plan — only newly-dead workers do. Live proof: a real worker
+  serving demo-100m through a real `VramPagedKVCache` over a slow
+  fake `VramAccess` (50 ms/read) generated 23 tokens in 12.3 s
+  (22 decodes, 10 post-flush, chunkFlushes=12, vramReads=132) with
+  zero suspect/dead transitions and max heartbeat gap 2,338 ms
+  (500 ms interval) — the generation's wall time exceeded the 6 s
+  suspect timeout while heartbeats kept flowing. A control test
+  proves the detector works (blocking the event loop 6.5 s trips
+  suspect), so the clean live run is a real pass. Caveat the test
+  also measures: the 2.3 s max gap shows synchronous matmul still
+  delays heartbeats measurably — a long *synchronous* prefill can
+  still trip suspect (the known symptom); only the slow *async*
+  vRAM reads are proven not to.
 - **P8 — met, numbers in `docs/VRAM-WEIGHTS.md` and
   `bench-kv-{before,after-host,after}.json` (final bench 2026-11-23
   03:34–04:12 UTC, post leak-fix).** Short (ctx 18): host TTFT 3,527

@@ -191,6 +191,71 @@ try {
   assert.ok(weird instanceof BpeTokenizer, "unrecognised pre-tokenizer still loads as BPE");
   assert.equal(weird.decode(weird.encode("hello world")), "hello world");
 
+  // --- GPT-2-style tokenizer.json carries no bos/eos: tokenizer_config.json
+  // + config.json supply them (SmolLM-135M shape). Without them the
+  // tokenizer falls back to the demo defaults 256/257/258 — which are real
+  // vocab tokens here ("q"/"y"/"x"), so decode() would drop them.
+  const SMOL_VOCAB: Record<string, number> = {
+    "<|endoftext|>": 0,
+    h: 1,
+    e: 2,
+    l: 3,
+    o: 4,
+    he: 5,
+    hel: 6,
+    hell: 7,
+    hello: 8,
+    "Ġ": 9,
+    q: 256,
+    y: 257,
+    x: 258,
+  };
+  const SMOL_MERGES = ["h e", "he l", "hel l", "hell o"];
+  const smolJson = (): Record<string, unknown> => ({
+    version: "1.0",
+    added_tokens: [
+      { id: 0, content: "<|endoftext|>", single_word: false, lstrip: false, rstrip: false, normalized: false, special: true },
+    ],
+    pre_tokenizer: GPT2_PRE_TOKENIZER,
+    model: { type: "BPE", vocab: SMOL_VOCAB, merges: SMOL_MERGES, unk_token: "<|endoftext|>" },
+    decoder: { type: "ByteLevel" },
+  });
+  const smolDir = path.join(tmp, "smol-style");
+  fs.mkdirSync(smolDir, { recursive: true });
+  fs.writeFileSync(path.join(smolDir, "tokenizer.json"), JSON.stringify(smolJson()), "utf-8");
+  // bos/eos come from tokenizer_config.json names; pad only from config.json.
+  fs.writeFileSync(
+    path.join(smolDir, "tokenizer_config.json"),
+    JSON.stringify({ bos_token: "<|endoftext|>", eos_token: "<|endoftext|>" }),
+    "utf-8",
+  );
+  fs.writeFileSync(
+    path.join(smolDir, "config.json"),
+    JSON.stringify({ pad_token_id: 0 }),
+    "utf-8",
+  );
+  const smolTok = loadTokenizer(smolDir);
+  assert.ok(smolTok instanceof BpeTokenizer, "smol-style fixture loads as BPE");
+  assert.equal(smolTok.bosTokenId, 0, "bos from tokenizer_config.json");
+  assert.equal(smolTok.eosTokenId, 0, "eos from tokenizer_config.json");
+  assert.equal(smolTok.padTokenId, 0, "pad from config.json");
+  assert.equal(smolTok.decode([256, 257, 258]), "qyx", "real tokens survive decode");
+  assert.equal(smolTok.decode([0, 8]), "hello", "EOS still skipped on decode");
+  assert.deepEqual(smolTok.encode("hello"), [8]);
+
+  // Negative control: same tokenizer.json, no sibling files -> demo
+  // defaults 256/257, and the real tokens behind those ids drop on decode.
+  // (Pad falls back to EOS here, so 258 is no longer treated as special.)
+  const bareDir = path.join(tmp, "smol-bare");
+  fs.mkdirSync(bareDir, { recursive: true });
+  fs.writeFileSync(path.join(bareDir, "tokenizer.json"), JSON.stringify(smolJson()), "utf-8");
+  const bareTok = loadTokenizer(bareDir);
+  assert.ok(bareTok instanceof BpeTokenizer, "bare fixture still loads as BPE");
+  assert.equal(bareTok.bosTokenId, 256);
+  assert.equal(bareTok.eosTokenId, 257);
+  assert.equal(bareTok.padTokenId, 257, "pad falls back to EOS when unspecified");
+  assert.equal(bareTok.decode([256, 257]), "", "default specials drop real tokens");
+
   // --- loadTokenizer falls back to byte-level for the demo model + missing files. ---
   const demoDir = fileURLToPath(new URL("../demo/models/demo-10m", import.meta.url));
   const demoTok = loadTokenizer(demoDir);

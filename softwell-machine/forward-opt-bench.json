@@ -1,0 +1,373 @@
+{
+  "label": "forward-opt-core",
+  "model": "smollm-135m",
+  "params": 134015488,
+  "timestamp": "2026-11-23T05:24:26.306Z",
+  "prompt": "The capital of France is",
+  "promptTokens": 5,
+  "maxTokens": 16,
+  "method": "in-process reference backend, temp 0 greedy; short prompt only, 3 reps generate + prefill probe, 16 decode-only forwards; host shared with 3 other agents, load varies run to run \u2014 see per-run loadavg",
+  "kernel": "matmulTransposeB 4-way unrolled dot (src/engine/attention.ts only)",
+  "before": [
+    {
+      "prompt": "The capital of France is",
+      "promptTokens": 5,
+      "maxTokens": 16,
+      "prefillMs": [
+        3189,
+        1892,
+        1899
+      ],
+      "medianPrefillMs": 1899,
+      "generateRuns": [
+        {
+          "rep": 1,
+          "ms": 8341,
+          "tokPerSec": 1.92,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 2,
+          "ms": 7418,
+          "tokPerSec": 2.16,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 3,
+          "ms": 8341,
+          "tokPerSec": 1.92,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        }
+      ],
+      "medianGenerateTokPerSec": 1.92,
+      "tokenIdentityAcrossReps": true,
+      "decodeOnlyMs": [
+        504,
+        664,
+        533,
+        801,
+        1094,
+        603,
+        608,
+        664,
+        513,
+        585,
+        708,
+        716,
+        600,
+        583,
+        612,
+        915
+      ],
+      "medianDecodeMs": 612.5,
+      "decodeOnlyTokPerSec": 1.63
+    },
+    {
+      "prompt": "The capital of France is",
+      "promptTokens": 5,
+      "maxTokens": 16,
+      "prefillMs": [
+        3191,
+        3335,
+        3042
+      ],
+      "medianPrefillMs": 3191,
+      "generateRuns": [
+        {
+          "rep": 1,
+          "ms": 16133,
+          "tokPerSec": 0.99,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 2,
+          "ms": 10983,
+          "tokPerSec": 1.46,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 3,
+          "ms": 7708,
+          "tokPerSec": 2.08,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        }
+      ],
+      "medianGenerateTokPerSec": 1.46,
+      "tokenIdentityAcrossReps": true,
+      "decodeOnlyMs": [
+        393,
+        411,
+        642,
+        900,
+        726,
+        683,
+        716,
+        798,
+        799,
+        894,
+        622,
+        664,
+        902,
+        687,
+        810,
+        741
+      ],
+      "medianDecodeMs": 726,
+      "decodeOnlyTokPerSec": 1.38
+    }
+  ],
+  "after": [
+    {
+      "prompt": "The capital of France is",
+      "promptTokens": 5,
+      "maxTokens": 16,
+      "prefillMs": [
+        5282,
+        2822,
+        2881
+      ],
+      "medianPrefillMs": 2881,
+      "generateRuns": [
+        {
+          "rep": 1,
+          "ms": 11795,
+          "tokPerSec": 1.36,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 2,
+          "ms": 5533,
+          "tokPerSec": 2.89,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        },
+        {
+          "rep": 3,
+          "ms": 5472,
+          "tokPerSec": 2.92,
+          "tokens": [
+            7042,
+            30,
+            198,
+            504,
+            3575,
+            282,
+            4649,
+            314,
+            260,
+            3575,
+            282,
+            4649,
+            30,
+            198,
+            504,
+            3575
+          ],
+          "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+        }
+      ],
+      "medianGenerateTokPerSec": 2.89,
+      "tokenIdentityAcrossReps": true,
+      "decodeOnlyMs": [
+        272,
+        285,
+        283,
+        307,
+        329,
+        285,
+        323,
+        265,
+        313,
+        277,
+        297,
+        406,
+        412,
+        778,
+        636,
+        583
+      ],
+      "medianDecodeMs": 312.8,
+      "decodeOnlyTokPerSec": 3.2
+    }
+  ],
+  "summary": {
+    "generateTokPerSec_median": {
+      "beforeRun1": 1.92,
+      "beforeRun2": 1.46,
+      "afterRun1": 2.89
+    },
+    "decodeOnlyTokPerSec": {
+      "beforeRun1": 1.63,
+      "beforeRun2": 1.38,
+      "afterRun1": 3.2
+    },
+    "medianPrefillMs": {
+      "beforeRun1": 1899,
+      "beforeRun2": 3191,
+      "afterRun1": 2881
+    },
+    "tokenIdentity": "identical 16 tokens before and after, matching spec-draft baseline: [7042, 30, 198, 504, 3575, 282, 4649, 314, 260, 3575, 282, 4649, 30, 198, 504, 3575]",
+    "loadavgAtEnd": {
+      "beforeRun1": [
+        4.53,
+        2.29,
+        1.53
+      ],
+      "beforeRun2": [
+        0.37,
+        1.5,
+        1.46
+      ],
+      "afterRun1": [
+        0.77,
+        1.9,
+        1.57
+      ]
+    }
+  },
+  "microbench": "interleaved medians, same process (scripts/profile-forward.ts): u4 vs serial matmulTransposeB 1.32-1.54x across q/o, gate, down, lm_head, prefill shapes; transposed-weight i,k,j variant 0.80-1.00x (rejected)",
+  "notMeasured": "long prompt (deferred to follow-up); demo-100m (deferred)"
+}

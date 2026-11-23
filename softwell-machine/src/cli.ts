@@ -36,7 +36,9 @@
  * src/mesh/worker.ts `loaderFor`), so activating a different model
  * re-plans and re-stages the workers without a restart. `softwell up`
  * without --model-dir starts workers on the demo model directory when
- * it exists. See docs/SERVER.md.
+ * it exists, and with no model directory at all when it does not — a
+ * diskless worker loads its first stage from staged vRAM weights on
+ * assignment. See docs/SERVER.md.
  */
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -56,14 +58,15 @@ import {
   type VirtualMachine,
 } from "./contracts.ts";
 import { describeEngineOptions, engineOptionsToFlags, parseEngineFlags } from "./engine/options.ts";
-import { loadManifest } from "./model/loader.ts";
-import { loadTokenizer } from "./model/tokenizer.ts";
+import { createReferenceBackend } from "./engine/backend.ts";
+import { VramWeightLoader } from "./model/vram-loader.ts";
 import { downloadModel, resolveModelRef } from "./model/hub.ts";
 import { plan, replan } from "./planner/planner.ts";
 import { WorkerRegistry } from "./mesh/registry.ts";
 import { createMeshServer, MeshClient } from "./mesh/protocol.ts";
 import type { MeshServerHandlers } from "./mesh/protocol.ts";
 import { ContinuousBatchingScheduler } from "./scheduler/batch.ts";
+import { loadDraftModel, type DraftModel } from "./scheduler/draft-model.ts";
 import { sampleLogits } from "./engine/sampling.ts";
 import { ModelRegistry, createWeightHandlers } from "./server/registry.ts";
 import { createKvHandlers } from "./server/vram-kv.ts";
@@ -93,6 +96,14 @@ export interface CliOptions {
    *  to the baseline. Passed to workers (engine modes) and the scheduler
    *  (decoding mode). */
   engineOptions: EngineOptions;
+  /**
+   * Draft-model directory for speculative decoding (--draft-model).
+   * Requires --decoding speculative (parseArgs enforces it). The draft
+   * model is staged through the ModelRegistry like any model and its
+   * executor reads weights from pooled vRAM; it is never served as the
+   * active model itself.
+   */
+  draftModelDir?: string;
   /**
    * Where the workers keep their KV cache: "host" (worker-local memory,
    * the default) or "vram" (pooled vRAM, replicated — docs/KV-DESIGN.md
@@ -133,6 +144,12 @@ Usage:
     --decoding autoregressive|speculative|jacobi
                                         token generation (Theorems S1/S2, greedy only)
     --draft-length K                    draft length / Jacobi block size (default 4)
+    --draft-model <dir>                 draft model for speculative decoding
+                                        (a second loaded model; staged through
+                                        vSSD/vRAM like any model, drafted through
+                                        its own StageExecutor). Requires
+                                        --decoding speculative. The draft model
+                                        must share the target's tokenizer/vocab.
 
   KV cache store (default host):
     --kv-store host|vram                host = worker-local memory;
@@ -140,7 +157,7 @@ Usage:
                                         (replicated, healed on donor loss)
 
 Defaults: --workers ${DEFAULT_WORKERS}, --port ${DEFAULT_ORCHESTRATOR_PORT}, --api-port ${DEFAULT_API_PORT}.
-The demo model (demo/models/demo-10m) is used for workers when no model is given and it exists.`);
+The demo model (demo/models/demo-10m) is used for workers when no model is given and it exists; without it workers boot with no model directory and load their stages from vRAM on activation.`);
 }
 
 export function parseArgs(argv: string[]): CliOptions {
@@ -165,6 +182,7 @@ export function parseArgs(argv: string[]): CliOptions {
     else if (a === "--port") opts.port = Number(argvRest[++i]);
     else if (a === "--api-port") opts.apiPort = Number(argvRest[++i]);
     else if (a === "--model-dir") opts.modelDir = argvRest[++i];
+    else if (a === "--draft-model") opts.draftModelDir = argvRest[++i];
     else if (a === "--memory") opts.memoryBytes = Number(argvRest[++i]);
     else if (a === "--kv-store") {
       const v = argvRest[++i];
@@ -177,6 +195,11 @@ export function parseArgs(argv: string[]): CliOptions {
   if (opts.command === "run" || opts.command === "serve") {
     if (rest.length === 0) throw new Error(`softwell ${opts.command} needs a <model> argument`);
     opts.modelRef = rest[0];
+  }
+  if (opts.draftModelDir !== undefined && opts.engineOptions.decoding !== "speculative") {
+    throw new Error(
+      `--draft-model requires --decoding speculative (got decoding=${opts.engineOptions.decoding ?? "autoregressive"})`,
+    );
   }
   return opts;
 }
@@ -237,10 +260,18 @@ export interface ServingState {
   plan: ShardPlan | null;
   scheduler: InstrumentedScheduler | null;
   inner: ContinuousBatchingScheduler | null;
+  /**
+   * Loaded draft model for speculative decoding (--draft-model), or
+   * null when none was given. Set once in serveCluster (after the
+   * registry stages it) and read by the factory at every activation;
+   * it is independent of the active model, so activation/dispose never
+   * clears it.
+   */
+  draftModel: DraftModel | null;
 }
 
 function createServingState(): ServingState {
-  return { modelId: null, modelDir: null, plan: null, scheduler: null, inner: null };
+  return { modelId: null, modelDir: null, plan: null, scheduler: null, inner: null, draftModel: null };
 }
 
 async function resolveModelDir(opts: CliOptions): Promise<string> {
@@ -282,11 +313,13 @@ export interface BootClusterOptions {
   engineOptions: EngineOptions;
   /** KV cache store for the spawned workers (default "host"). */
   kvStore?: "host" | "vram";
-  /** Local model directory workers load weights from at spawn. Workers
-   *  open one weight loader at startup, so this pins what they can serve;
-   *  it is NOT the active model — activation happens later, through the
-   *  factory, and must name a model from this directory. */
-  workerModelDir: string;
+  /** Local model directory workers load weights from at spawn. Optional:
+   *  when omitted, workers boot with no spawn-time loader (a diskless
+   *  donor) and load their first stage from the orchestrator's staged
+   *  vRAM weights once an assignment names a staged model. It is NOT
+   *  the active model — activation happens later, through the factory,
+   *  and must name a model staged in vRAM/vSSD. */
+  workerModelDir?: string;
 }
 
 export interface BootedCluster {
@@ -342,8 +375,9 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
         WORKER_ENTRY,
         "--orchestrator",
         orchestratorUrl,
-        "--model-dir",
-        opts.workerModelDir,
+        // No --model-dir when none was given: the worker boots diskless
+        // and loads its stage from staged vRAM weights on assignment.
+        ...(opts.workerModelDir !== undefined ? ["--model-dir", opts.workerModelDir] : []),
         "--port",
         "0",
         ...(opts.kvStore !== undefined ? ["--kv-store", opts.kvStore] : []),
@@ -403,26 +437,38 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
 
 /**
  * Build the ServingContextFactory for a VirtualServer. Given a loaded
- * ModelEntry it reads the manifest, plans the model over the live workers
- * (throwing the planner's reason when infeasible), stamps modelId +
- * modelDir onto every assignment, installs the plan, and builds a
+ * ModelEntry it takes the manifest from the registry's staged copy
+ * (`getManifest` — recorded when the model was staged, never re-read
+ * from disk) and the tokenizer from the staged vSSD copy
+ * (`getTokenizer` — tokenizer.json read out of vSSD and parsed from
+ * bytes), plans the model over the live workers (throwing the planner's
+ * reason when infeasible), stamps modelId + modelDir onto every
+ * assignment, installs the plan, and builds a
  * ContinuousBatchingScheduler (MeshClient transport, sampleLogits,
  * tokenizer decode, engine decoding options) wrapped in the
  * InstrumentedScheduler. Workers load their shards from pooled vRAM
- * over the mesh weight endpoint (falling back to the model directory
- * only before a model is staged); the CLI never opens a weight loader
- * itself.
+ * over the mesh weight endpoint; the CLI never opens a weight loader
+ * itself, and activation never reads the model directory — a model
+ * stays activatable after its directory is moved away. A model with
+ * no staged manifest cannot be activated at all: that throws here
+ * instead of falling back to disk.
  */
 export function buildFactory(
   registry: WorkerRegistry,
   opts: CliOptions,
   servingState: ServingState,
+  modelRegistry: ModelRegistry,
 ): ServingContextFactory {
   const client = new MeshClient({ timeoutMs: 30_000 });
   return {
     async build(entry: ModelEntry): Promise<ServingContext> {
-      const manifest = loadManifest(entry.dir, entry.id);
-      const tokenizer = loadTokenizer(entry.dir);
+      const manifest = modelRegistry.getManifest(entry.id);
+      if (manifest === undefined) {
+        throw new Error(
+          `model "${entry.id}" has no staged manifest in vRAM/vSSD — load it first; activation never reads the model directory from disk`,
+        );
+      }
+      const tokenizer = await modelRegistry.getTokenizer(entry.id);
       console.log(
         `softwell: ${manifest.modelId} — ${(manifest.totalParams / 1e6).toFixed(1)}M params, ` +
           `${(manifest.totalBytes / 1024 / 1024).toFixed(1)} MB, ${manifest.config.numHiddenLayers} layers`,
@@ -443,6 +489,15 @@ export function buildFactory(
       );
       // Novel decoding mode (speculative/Jacobi) is a scheduler option; the
       // engine modes (attention/weights/KV) already went to the workers.
+      // With a draft model loaded (--draft-model), speculative sequences
+      // draft through it: one ModelDrafter per sequence, built lazily by
+      // this factory. The vocab check runs eagerly here so a mismatch
+      // fails the activation loudly instead of failing the first
+      // sequence mid-run; createDrafter re-checks per sequence.
+      const draftModel = servingState.draftModel;
+      if (draftModel !== null) {
+        draftModel.checkTargetVocab(manifest.config.vocabSize);
+      }
       const inner = new ContinuousBatchingScheduler({
         plan: stamped,
         transport: async (workerId, req) => {
@@ -472,6 +527,10 @@ export function buildFactory(
         rolesByWorker: Object.fromEntries(workers.map((w) => [w.workerId, w.roles])),
         decoding: opts.engineOptions.decoding,
         draftLength: opts.engineOptions.draftLength,
+        draftDrafterFactory:
+          draftModel !== null
+            ? (seqId: string) => draftModel.createDrafter(seqId, manifest.config.vocabSize)
+            : undefined,
       });
       const scheduler = new InstrumentedScheduler(inner);
       servingState.modelId = entry.id;
@@ -556,10 +615,12 @@ async function waitForPidExit(pid: number, timeoutMs: number): Promise<boolean> 
  * the process stays alive on its listening servers.
  */
 async function serveCluster(opts: CliOptions, bootModelDir: string | undefined): Promise<void> {
-  // Workers open one weight loader at spawn, so they need a model
-  // directory even when no model is active yet. The demo model is the
-  // fallback; without it the caller must name a directory.
-  let workerModelDir: string;
+  // Workers open one weight loader at spawn when a model directory is
+  // given; the demo model is the fallback. With neither, workers boot
+  // diskless (no --model-dir) and load their first stage from staged
+  // vRAM weights once a model is activated — that is how a remote donor
+  // with nothing on disk joins.
+  let workerModelDir: string | undefined;
   if (bootModelDir !== undefined) {
     workerModelDir = bootModelDir;
   } else if (fs.existsSync(DEMO_MODEL_DIR)) {
@@ -568,8 +629,8 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
       `softwell: no --model-dir given; workers start with the demo model directory (${DEMO_MODEL_DIR})`,
     );
   } else {
-    throw new Error(
-      "no model directory for workers: pass --model-dir <dir> or run `npm run make-demo-model` so the demo model exists",
+    console.log(
+      "softwell: no --model-dir given and no demo model on disk; workers boot without a model directory and load stages from vRAM on activation",
     );
   }
   if (bootModelDir !== undefined) {
@@ -585,7 +646,16 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
     workerModelDir,
   });
   const { registry, meshServer, children, hypervisor, vm, servingState, getCluster } = cluster;
-  const factory = buildFactory(registry, opts, servingState);
+  const modelRegistry = new ModelRegistry({
+    vm: () => vm,
+    stageToVram: (key: string) => hypervisor.stageToVram(key),
+    readVram: (vaddr: number, length: number) => vm.ram.read(vaddr, length),
+    isActive: (id: string) => server?.getActive()?.modelId === id,
+    modelsDir: path.resolve("models"),
+  });
+  // The factory needs the registry: activation takes the manifest from
+  // the staged copy and the tokenizer from staged vSSD, never from disk.
+  const factory = buildFactory(registry, opts, servingState, modelRegistry);
 
   let server: VirtualServer | null = null;
   let shuttingDown = false;
@@ -603,13 +673,6 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
     process.exit(0);
   };
 
-  const modelRegistry = new ModelRegistry({
-    vm: () => vm,
-    stageToVram: (key: string) => hypervisor.stageToVram(key),
-    readVram: (vaddr: number, length: number) => vm.ram.read(vaddr, length),
-    isActive: (id: string) => server?.getActive()?.modelId === id,
-    modelsDir: path.resolve("models"),
-  });
   // Attach the binary weight endpoint to the orchestrator's mesh server:
   // workers fetch staged manifests + weight maps (JSON) and tensor bytes
   // (octet-stream) from pooled vRAM through these handlers. The registry
@@ -634,6 +697,41 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
     getCluster,
     onShutdown: () => void shutdown(),
   });
+  // Draft model (--draft-model): stage it through the ModelRegistry
+  // like any model (vSSD -> vRAM) BEFORE the boot model is activated,
+  // so the factory can hand its drafters to the scheduler at
+  // activation time. The draft executor reads its weights from pooled
+  // vRAM (VramWeightLoader) — never from disk after staging. A draft
+  // that fails to load (unknown ref, unreadable dir, does not fit)
+  // fails startup loudly: a silently n-gram fallback would measure
+  // the wrong drafter. The draft model is staged, not activated: it
+  // never becomes the serving model.
+  if (opts.draftModelDir !== undefined) {
+    const draftEntry = await server.loadModel(opts.draftModelDir);
+    if (draftEntry.status !== "ready") {
+      throw new Error(
+        `draft model "${opts.draftModelDir}" failed to load: ${draftEntry.error ?? draftEntry.status}`,
+      );
+    }
+    const staged = modelRegistry.getWeightMapResponse(draftEntry.id);
+    if (staged === null) {
+      throw new Error(
+        `draft model "${draftEntry.id}" loaded but its weights are not staged in vRAM (staging bug — refusing to fall back to disk)`,
+      );
+    }
+    const draftLoader = new VramWeightLoader(staged.manifest, staged.weightMap, (name) =>
+      modelRegistry.readWeightTensor(draftEntry.id, name),
+    );
+    servingState.draftModel = await loadDraftModel({
+      loader: draftLoader,
+      backend: createReferenceBackend(),
+      engineOptions: opts.engineOptions,
+    });
+    console.log(
+      `softwell: draft model ${draftEntry.id} loaded from vRAM ` +
+        `(${(staged.manifest.totalParams / 1e6).toFixed(1)}M params) — speculative decoding drafts through it`,
+    );
+  }
   // Load + activate the boot model BEFORE starting the API server, so
   // the API only opens once the model is actually serving (the demo and
   // clients treat "the API answers" as "ready to generate"). The

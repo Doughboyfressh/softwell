@@ -1,0 +1,129 @@
+{
+  "label": "forward-opt-after",
+  "phase": "after",
+  "timestamp": "2026-11-23T05:24:26.306Z",
+  "model": "smollm-135m",
+  "params": 134015488,
+  "host": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 4,
+    "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+    "totalMemMiB": 7934,
+    "freeMemMiB": 1441,
+    "loadavg": [
+      0.77,
+      1.9,
+      1.57
+    ]
+  },
+  "short": {
+    "prompt": "The capital of France is",
+    "promptTokens": 5,
+    "maxTokens": 16,
+    "prefillMs": [
+      5282,
+      2822,
+      2881
+    ],
+    "medianPrefillMs": 2881,
+    "generateRuns": [
+      {
+        "rep": 1,
+        "ms": 11795,
+        "tokPerSec": 1.36,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      },
+      {
+        "rep": 2,
+        "ms": 5533,
+        "tokPerSec": 2.89,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      },
+      {
+        "rep": 3,
+        "ms": 5472,
+        "tokPerSec": 2.92,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      }
+    ],
+    "medianGenerateTokPerSec": 2.89,
+    "tokenIdentityAcrossReps": true,
+    "decodeOnlyMs": [
+      272,
+      285,
+      283,
+      307,
+      329,
+      285,
+      323,
+      265,
+      313,
+      277,
+      297,
+      406,
+      412,
+      778,
+      636,
+      583
+    ],
+    "medianDecodeMs": 312.8,
+    "decodeOnlyTokPerSec": 3.2
+  },
+  "long": null
+}

@@ -181,11 +181,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Canonical safetensors dtype codes for the internal WeightDtype names.
+ * Real HF files use these codes (F32, F16, BF16, F8_E4M3); our own
+ * writer used to emit the long names, which no spec reader accepts.
+ */
+const CANONICAL_DTYPE: Record<WeightDtype, string> = {
+  bfloat16: "BF16",
+  float16: "F16",
+  float32: "F32",
+  float8_e4m3: "F8_E4M3",
+};
+
 function parseTensorMeta(name: string, raw: unknown): TensorMeta {
   if (!isRecord(raw)) throw new Error(`safetensors header: tensor "${name}" is not an object`);
-  const dtype = raw["dtype"];
-  if (dtype !== "bfloat16" && dtype !== "float16" && dtype !== "float32" && dtype !== "float8_e4m3") {
-    throw new Error(`safetensors header: tensor "${name}" has unsupported dtype ${String(dtype)}`);
+  const rawDtype = raw["dtype"];
+  // Real safetensors files use the canonical dtype codes (F32, F16, BF16,
+  // F8_E4M3); our own writer emits the long names (float32, ...). Accept
+  // both, normalizing to the internal WeightDtype.
+  const dtype: WeightDtype | undefined =
+    rawDtype === "bfloat16" || rawDtype === "BF16"
+      ? "bfloat16"
+      : rawDtype === "float16" || rawDtype === "F16"
+        ? "float16"
+        : rawDtype === "float32" || rawDtype === "F32"
+          ? "float32"
+          : rawDtype === "float8_e4m3" || rawDtype === "F8_E4M3"
+            ? "float8_e4m3"
+            : undefined;
+  if (dtype === undefined) {
+    throw new Error(`safetensors header: tensor "${name}" has unsupported dtype ${String(rawDtype)}`);
   }
   const shape = raw["shape"];
   if (!Array.isArray(shape) || !shape.every((d) => Number.isInteger(d) && (d as number) >= 0)) {
@@ -252,6 +277,9 @@ export function safetensorsHeaderLength(buffer: Buffer): number {
 /**
  * Serialize a tensor map (+ optional metadata) into the on-disk header
  * bytes: 8-byte little-endian JSON length followed by the JSON itself.
+ * Dtypes are written as the canonical safetensors codes (F32, F16, BF16,
+ * F8_E4M3) — the same codes parseSafetensorsHeader accepts — so files
+ * written here are valid safetensors for any reader, not just ours.
  */
 export function serializeSafetensorsHeader(
   tensors: Record<string, TensorMeta>,
@@ -261,7 +289,7 @@ export function serializeSafetensorsHeader(
   if (Object.keys(metadata).length > 0) obj["__metadata__"] = metadata;
   for (const [name, meta] of Object.entries(tensors)) {
     const header: RawTensorHeader = {
-      dtype: meta.dtype,
+      dtype: CANONICAL_DTYPE[meta.dtype],
       shape: meta.shape,
       data_offsets: [meta.dataOffsets[0], meta.dataOffsets[1]],
     };

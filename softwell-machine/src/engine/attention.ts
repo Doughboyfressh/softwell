@@ -49,7 +49,15 @@ export function matmul(
  * Row-major matmul C = A @ B^T, where B is stored [bRows, bCols] and
  * aCols === bCols. This is the shape weights arrive in from safetensors
  * ([out, in]): logits = hidden @ lm_head^T, q = hidden @ Wq^T, etc.
- * Loop order i,j,k keeps the inner loop over contiguous rows of A and B.
+ *
+ * The dot product is unrolled by 4 with four independent accumulators.
+ * A serial `sum += a*b` chain stalls on FP-add latency (~3-4 cycles per
+ * step in scalar JS); four independent chains let V8 keep the pipeline
+ * full. Measured on this host (SmolLM-135M shapes, interleaved medians):
+ * 1.32-1.54x vs the serial loop, with bit-identical Float32 outputs at
+ * these magnitudes (verified in test/forward-opt.test.ts). The
+ * pre-transposed i,k,j matvec variant was measured slower (0.80-1.00x)
+ * and was not adopted — see docs/FORWARD-OPT.md.
  */
 export function matmulTransposeB(
   a: Float32Array, aRows: number, aCols: number,
@@ -64,8 +72,17 @@ export function matmulTransposeB(
     const cRow = i * bRows;
     for (let j = 0; j < bRows; j++) {
       const bRow = j * bCols;
-      let sum = 0;
-      for (let k = 0; k < aCols; k++) sum += a[aRow + k] * b[bRow + k];
+      let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+      let k = 0;
+      const lim = aCols - (aCols % 4);
+      for (; k < lim; k += 4) {
+        s0 += a[aRow + k] * b[bRow + k];
+        s1 += a[aRow + k + 1] * b[bRow + k + 1];
+        s2 += a[aRow + k + 2] * b[bRow + k + 2];
+        s3 += a[aRow + k + 3] * b[bRow + k + 3];
+      }
+      let sum = (s0 + s1) + (s2 + s3);
+      for (; k < aCols; k++) sum += a[aRow + k] * b[bRow + k];
       c[cRow + j] = sum;
     }
   }

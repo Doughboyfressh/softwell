@@ -47,7 +47,16 @@ export interface StartWorkerOptions {
   port: number;
   capability: Omit<WorkerCapability, "host" | "port">;
   backend: EngineBackend;
-  loader: WeightLoader;
+  /**
+   * Spawn-time weight loader. Optional: a worker may boot with no model
+   * directory at all (a remote donor joining with nothing on disk), in
+   * which case there is no spawn-time loader and the first stage load
+   * must come from the orchestrator's staged vRAM weights
+   * (`loaderFor`, modelId path). With a loader, the old behaviour holds:
+   * it is seeded in the loader cache and serves assignments that name
+   * no model (the v1 path).
+   */
+  loader?: WeightLoader;
   /** Engine options for the stage executor (attention / weights / KV modes).
    *  Omit for the baseline. The decoding mode is a scheduler concern and
    *  does not affect the worker. */
@@ -141,16 +150,23 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
 
   /**
    * Weight loaders by model key (modelId when the assignment carries one,
-   * else the model dir). The spawn-time loader is seeded under its
-   * manifest's modelId, so switching back to it is a cache hit. Loaders
-   * are never evicted within a process lifetime; close() closes them all.
+   * else the model dir). The spawn-time loader, when one was given, is
+   * seeded under its manifest's modelId, so switching back to it is a
+   * cache hit. A diskless worker starts with an empty cache: every
+   * loader it ever uses comes from the orchestrator's vRAM staging.
+   * Loaders are never evicted within a process lifetime; close() closes
+   * them all.
    */
   const loaders = new Map<string, WeightLoader>();
-  loaders.set(opts.loader.manifest.modelId, opts.loader);
-  /** Loader the current executor was built from (starts as spawn-time). */
-  let currentLoader: WeightLoader = opts.loader;
-  /** Cache key of `currentLoader`. */
-  let currentModelKey: string = opts.loader.manifest.modelId;
+  if (opts.loader !== undefined) {
+    loaders.set(opts.loader.manifest.modelId, opts.loader);
+  }
+  /** Loader the current executor was built from (null until the first
+   *  stage load on a diskless worker). */
+  let currentLoader: WeightLoader | null = opts.loader ?? null;
+  /** Cache key of `currentLoader` (null until the first stage load). */
+  let currentModelKey: string | null =
+    opts.loader !== undefined ? opts.loader.manifest.modelId : null;
 
   const log = (...args: unknown[]): void => {
     console.log(`[worker ${workerId || "starting"}]`, ...args);
@@ -161,7 +177,9 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
    * fallback — and log which one was chosen, so a stage load's weight
    * source is always visible in the worker log.
    *
-   *  1. No modelId and no modelDir: the v1 behaviour (spawn-time loader).
+   *  1. No modelId and no modelDir: the v1 behaviour (spawn-time loader)
+   *     when one exists; null on a diskless worker (no stage can load
+   *     from nothing — the caller keeps the old stage and retries).
    *  2. Same model as the current stage, or a cached loader: reuse it
    *     (a cached VramWeightLoader is reused without another map fetch).
    *  3. modelId present: ask the orchestrator for the staged manifest +
@@ -174,13 +192,14 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
    *  4. Disk fallback, ONLY when the orchestrator has not staged the
    *     model (pre-activation / v1 path): openWeightLoader(modelDir).
    *     A model dir that cannot be opened -> null, keep the old stage.
-   *     No modelDir at all -> the spawn-time loader (v1 behaviour).
+   *     No modelDir at all -> the spawn-time loader when one exists,
+   *     else null (a diskless worker never invents a loader).
    * Returns null when the new model cannot be loaded — the caller then
    * keeps serving the old stage and retries on the next poll.
    */
   async function loaderFor(assignment: ShardAssignment): Promise<WeightLoader | null> {
     if (assignment.modelDir === undefined && assignment.modelId === undefined) {
-      return opts.loader;
+      return opts.loader ?? null;
     }
     // Step 1 above guarantees at least one of modelId/modelDir is set.
     const key = (assignment.modelId ?? assignment.modelDir) as string;
@@ -209,11 +228,18 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
         );
         return vramLoader;
       }
-      log(
-        `model ${assignment.modelId} is not staged in vRAM on the orchestrator; falling back to the disk loader`,
-      );
+      if (assignment.modelDir !== undefined) {
+        log(
+          `model ${assignment.modelId} is not staged in vRAM on the orchestrator; falling back to the disk loader`,
+        );
+      } else {
+        log(
+          `model ${assignment.modelId} is not staged in vRAM on the orchestrator and no model directory was given; keeping previous stage`,
+        );
+        return null;
+      }
     }
-    if (assignment.modelDir === undefined) return opts.loader;
+    if (assignment.modelDir === undefined) return opts.loader ?? null;
     try {
       const opened = openWeightLoader(assignment.modelDir, assignment.modelId);
       loaders.set(key, opened);
@@ -547,8 +573,14 @@ async function main(): Promise<void> {
     "SOFTWELL_WORKER_MEMORY_BYTES",
     8 * 1024 * 1024 * 1024,
   );
-  const modelDir =
+  const modelDirRaw =
     argValue(argv, "model-dir") ?? process.env.SOFTWELL_MODEL_DIR ?? "";
+  // --model-dir is optional: a diskless worker (a remote donor joining
+  // with no model on disk) boots with no spawn-time loader and loads
+  // its first stage from the orchestrator's staged vRAM weights once
+  // an assignment names a staged model. An empty --model-dir / env
+  // value counts as absent, not as a directory.
+  const modelDir = modelDirRaw === "" ? undefined : modelDirRaw;
   const deviceRaw =
     argValue(argv, "device") ?? process.env.SOFTWELL_WORKER_DEVICE ?? "cpu";
   const device: WorkerDevice = (
@@ -556,19 +588,6 @@ async function main(): Promise<void> {
   ).includes(deviceRaw)
     ? (deviceRaw as WorkerDevice)
     : "cpu";
-
-  if (modelDir === "") {
-    console.error(
-      "usage: node src/mesh/worker.ts [--orchestrator <url>] [--host <host>] [--port <n>] [--model-dir <dir>]\n" +
-        "  [--attention exact|landmark|sparse] [--weights fp32|sw2|sw3|sw4] [--kv fp32|sw2|sw3|sw4]\n" +
-        "  [--kv-store host|vram]\n" +
-        "  env: SOFTWELL_ORCHESTRATOR_URL, SOFTWELL_WORKER_HOST, SOFTWELL_WORKER_PORT,\n" +
-        "       SOFTWELL_WORKER_MEMORY_BYTES, SOFTWELL_WORKER_DEVICE, SOFTWELL_MODEL_DIR (required),\n" +
-        "       SOFTWELL_KV_STORE",
-    );
-    process.exitCode = 2;
-    return;
-  }
 
   // KV store selection (docs/KV-DESIGN.md §5): `host` (default) keeps the
   // KV cache in worker-local memory; `vram` allocates its pages from
@@ -603,15 +622,25 @@ async function main(): Promise<void> {
   // stage load loudly instead of failing every sequence's first
   // append; the probe runs inside the factory because the factory is
   // async-capable (docs/KV-DESIGN.md §6.3).
-  let loader: WeightLoader;
-  try {
-    loader = openWeightLoader(modelDir);
-  } catch (err) {
-    console.error(
-      `[worker] cannot open model dir ${modelDir}: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    process.exitCode = 1;
-    return;
+  // The spawn-time loader is optional: with --model-dir it opens here
+  // (and a directory that cannot be opened still fails startup loudly,
+  // as before — a typo must not boot a worker that can never serve);
+  // without one the worker boots with no loader and its first stage
+  // load comes from the orchestrator's staged vRAM weights. The log
+  // line names which case this worker is in.
+  let loader: WeightLoader | undefined;
+  if (modelDir !== undefined) {
+    try {
+      loader = openWeightLoader(modelDir);
+    } catch (err) {
+      console.error(
+        `[worker] cannot open model dir ${modelDir}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+  } else {
+    console.log("[worker] no model directory — booting without a spawn-time loader; stages load from vRAM on assignment");
   }
   const createCache = async (
     manifest: ModelManifest,
