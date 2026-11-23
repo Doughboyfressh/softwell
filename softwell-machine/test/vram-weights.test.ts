@@ -251,10 +251,11 @@ const firstBytes100m = demo100mShard.subarray(
 function makeCache(): PagedKVCache {
   return {
     blockSize: 16,
-    allocate: () => [],
-    append: () => {},
-    read: () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
-    free: () => {},
+    allocate: async () => [],
+    append: async () => {},
+    read: async () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
+    free: async () => {},
+    close: async () => {},
     usedBlocks: () => 0,
     totalBlocks: () => 0,
   };
@@ -477,7 +478,7 @@ try {
           data: new Float32Array(tokenIds.length * 2),
           shape: [tokenIds.length, 2],
         }),
-        forward: (input: Tensor, _ctx: ForwardContext): Tensor => input,
+        forward: async (input: Tensor, _ctx: ForwardContext): Promise<Tensor> => input,
         memoryBytes: () => 4096,
       };
     },

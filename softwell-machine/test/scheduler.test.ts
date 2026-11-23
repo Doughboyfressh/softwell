@@ -22,7 +22,7 @@ import type {
   assert.equal(cache.usedBlocks(), 0);
 
   // 5 tokens need 2 blocks.
-  const table = cache.allocate("a", 0, 5);
+  const table = await cache.allocate("a", 0, 5);
   assert.equal(table.length, 2);
   assert.equal(cache.usedBlocks(), 2);
 
@@ -31,30 +31,30 @@ import type {
   for (let pos = 0; pos < 5; pos++) {
     const key = new Float32Array([pos, pos + 0.5, pos + 1, pos + 1.5, pos + 2, pos + 2.5]);
     const value = new Float32Array([100 + pos, 101 + pos, 102 + pos, 103 + pos, 104 + pos, 105 + pos]);
-    cache.append("a", 0, pos, key, value);
+    await cache.append("a", 0, pos, key, value);
   }
-  const { keys, values } = cache.read("a", 0, [4, 0, 2]);
+  const { keys, values } = await cache.read("a", 0, [4, 0, 2]);
   assert.deepEqual([...keys.slice(0, 6)], [4, 4.5, 5, 5.5, 6, 6.5]);
   assert.deepEqual([...keys.slice(6, 12)], [0, 0.5, 1, 1.5, 2, 2.5]);
   assert.deepEqual([...keys.slice(12, 18)], [2, 2.5, 3, 3.5, 4, 4.5]);
   assert.deepEqual([...values.slice(0, 6)], [104, 105, 106, 107, 108, 109]);
 
   // A second layer for the same sequence allocates its own blocks.
-  cache.allocate("a", 1, 1);
+  await cache.allocate("a", 1, 1);
   assert.equal(cache.usedBlocks(), 3);
 
   // Free releases everything.
-  cache.free("a");
+  await cache.free("a");
   assert.equal(cache.usedBlocks(), 0);
 
   // Out of memory: 20 tokens need 5 blocks but only 4 exist.
-  assert.throws(
-    () => cache.allocate("oom", 0, 20),
+  await assert.rejects(
+    async () => cache.allocate("oom", 0, 20),
     /out of memory/,
   );
   // The partial allocation is still held (2 blocks were taken before OOM
   // on the 5th); free it and the pool is whole again.
-  cache.free("oom");
+  await cache.free("oom");
   assert.equal(cache.usedBlocks(), 0);
 
   console.log("BlockPagedKVCache: ok");
@@ -251,6 +251,89 @@ function makeFakeTransport(calls: { workerId: string; req: Omit<ExecuteRequest, 
   assert.equal(scheduler.runningCount(), 0);
 
   console.log("ContinuousBatchingScheduler worker-failure handling: ok");
+}
+
+// ---------------------------------------------------------------------------
+// Chunked prefill: a long prompt goes out as 16-row chunks, not one execute
+// ---------------------------------------------------------------------------
+
+{
+  const calls: { workerId: string; req: Omit<ExecuteRequest, "workerId"> }[] = [];
+  const scheduler = new ContinuousBatchingScheduler({
+    plan: fakePlan(),
+    transport: makeFakeTransport(calls),
+    sampler: greedySampler,
+    decode: (ids) => ids.map((id) => `<${id}>`).join(""),
+    eosTokenId: EOS,
+    maxBatchTokens: 100,
+    maxSequences: 4,
+  });
+
+  // 40-token prompt + a 5-token prompt admitted in the same step:
+  // 45 rows = 16 + 16 + 13. One unchunked execute would carry all 45
+  // rows; the mesh timeout caps a single execute, so the scheduler must
+  // split it (the ~1k-token API prompt is the same shape, 63 chunks).
+  // The short sequence's last row is in chunk 1 and the long one's in
+  // chunk 3 — runStageChain must return each sequence's own last row,
+  // not just the last chunk's rows.
+  const prompt40 = Array.from({ length: 40 }, (_, i) => (i % 9) + 1);
+  scheduler.submit({
+    id: "seq-short",
+    prompt: "short",
+    tokenIds: [1, 2, 3, 4, 5],
+    sampling: { temperature: 0, topP: 1, topK: 0, maxTokens: 3 },
+    role: "mixed",
+  });
+  scheduler.submit({
+    id: "seq-long",
+    prompt: "long",
+    tokenIds: prompt40,
+    sampling: { temperature: 0, topP: 1, topK: 0, maxTokens: 3 },
+    role: "mixed",
+  });
+  const bySeq = new Map<string, number[]>();
+  for (let i = 0; i < 3; i++) {
+    const tokens = await scheduler.step();
+    for (const t of tokens) {
+      const list = bySeq.get(t.seqId) ?? [];
+      list.push(t.tokenId);
+      bySeq.set(t.seqId, list);
+    }
+  }
+  assert.deepEqual(
+    bySeq.get("seq-short"),
+    [3, 3, 3],
+    "short sequence (last row in chunk 1) generates the same tokens",
+  );
+  assert.deepEqual(
+    bySeq.get("seq-long"),
+    [3, 3, 3],
+    "long sequence (last row in chunk 3) generates the same tokens",
+  );
+  assert.equal(scheduler.getSequence("seq-short")?.status, "done");
+  assert.equal(scheduler.getSequence("seq-long")?.status, "done");
+
+  const prefill0 = calls.filter((c) => c.req.kind === "prefill" && c.req.stage === 0);
+  assert.equal(prefill0.length, 3, "45 rows go out as 3 prefill chunks");
+  assert.deepEqual(
+    prefill0.map((c) => c.req.positions.length),
+    [16, 16, 13],
+    "chunk sizes are 16, 16, 13",
+  );
+  assert.deepEqual(
+    prefill0.flatMap((c) => c.req.positions ?? []),
+    [...[0, 1, 2, 3, 4], ...Array.from({ length: 40 }, (_, i) => i)],
+    "chunks cover the short prompt then the long prompt, contiguously, in order",
+  );
+  assert.deepEqual(
+    prefill0[2]?.req.tokenIds,
+    prompt40.slice(27),
+    "the last chunk carries the long prompt's tail — its last row is what gets sampled for it",
+  );
+  const prefill1 = calls.filter((c) => c.req.kind === "prefill" && c.req.stage === 1);
+  assert.equal(prefill1.length, 3, "every chunk runs through every stage");
+
+  console.log("ContinuousBatchingScheduler chunked prefill: ok");
 }
 
 console.log("All scheduler tests passed.");

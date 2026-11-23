@@ -24,7 +24,8 @@ src/planner/              Shard planner (pipeline/tensor/expert parallel)
                           + cost model. cost.ts is where the hardware math lives.
 src/mesh/                 Donor registry: register, heartbeat, fault
                           detection (sweep), stage assignments, /mesh/execute.
-src/scheduler/            Continuous batching, paged KV cache (worker-local),
+src/scheduler/            Continuous batching, paged KV cache (host by
+                           default; pooled vRAM with --kv-store vram),
                           prefill/decode routing by worker role.
 src/engine/               Reference transformer: GQA attention, RoPE,
                           SwiGLU, MoE routing, sampling. The math here is
@@ -73,7 +74,11 @@ demo/                     ~10M-param random-weight model + end-to-end demo.
    re-assigns stages; the hypervisor sweep (5 s) heals the pools
    (vRAM/vSSD re-replicate, vGPU reassigns streams, vCPU requeues tasks).
    Sequences whose KV cache lived on the dead worker error out and must
-   be resubmitted — their cache is gone with the donor.
+   be resubmitted — their cache is gone with the worker. (Worker
+   death, not donor death: with KV in vRAM, flushed KV survives a
+   donor dying — replicas + healing — and only the worker-local chunk
+   table dies with the worker, so a pure donor loss no longer kills
+   the sequence. Proven by test/kvcache-vram-survival.test.ts.)
 
 ## The honest hardware math (from `src/planner/cost.ts`)
 
@@ -157,15 +162,29 @@ pipeline is real, the speed is whatever the hardware underneath is.
   runs the engine's math in-process — which *is* the vGPU's donor-side
   kernel execution (the same `CpuKernels` code) — but the per-op
   `vGPU.launch()` path is not the hot loop. Routing every matmul through
-  the coordinator is the identified next step; it needs `StageExecutor`
-  to become async and is documented as such in the code, not done here.
-- **The scheduler's KV cache is worker-local**, not allocated out of
-  pooled vRAM. The block size matches the vRAM page model, but the
-  integration (cache blocks as vRAM allocations) is future work. A
-  vRAM-backed prototype exists (`VramPagedKVCache`,
-  `src/scheduler/kvcache-vram.ts`, 2026-11-22) but is not wired into
-  the serving path, and its own measurements put a vRAM KV read at
-  ~19 ms vs ~0.02 ms from host memory — see `docs/VRAM-WEIGHTS.md`.
+  the coordinator is the identified next step; `StageExecutor.forward()`
+  is async since 2026-11-23 (the KV-cache-in-vRAM refactor), so the
+  interface no longer blocks it — it is documented as such in the code,
+  not done here.
+- **The scheduler's KV cache is worker-local by default**, but pooled
+  vRAM is wired in behind `--kv-store vram` (2026-11-23):
+  `VramPagedKVCache` (`src/scheduler/kvcache-vram.ts`) allocates its
+  pages from pooled vRAM (replicated, healed on donor loss) over
+  `RemoteVramAccess` (`src/scheduler/kvcache-vram-remote.ts`, the
+  orchestrator's `/mesh/vram/*` endpoints). The interface and
+  `forward()` went async to make that possible
+  (`docs/KV-DESIGN.md`). Measured cost (see the header of
+  `src/scheduler/kvcache-vram.ts` and
+  `test/kvcache-vram-bench-results-2026-11-22.json`): full-context
+  reads are ~parity with host at ctx 128 and ~6–9x at ctx 1024
+  (projected decode +75% at ctx 1024), so the default stays `host`
+  until a sub-page read path or in-place vGPU attention lands. The
+  survival contract is proven end-to-end by
+  `test/kvcache-vram-survival.test.ts`: a donor dying mid-generation
+  does not lose the sequence (flushed KV fails over, generation
+  continues identically); a worker dying still forces a resubmit
+  (the chunk table dies with the worker — flushed bytes survive in
+  vRAM but are unreachable without it).
 
 ## Mapping onto the existing softwell repo
 

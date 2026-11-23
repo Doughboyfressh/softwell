@@ -441,7 +441,14 @@ model's manifest over the survivors (keeping stage boundaries where
 they still fit), stamps `modelId`/`modelDir` on the new assignments,
 installs the plan and calls `scheduler.updatePlan`. Sequences that
 were running on the lost worker error on their next step and must be
-resubmitted — their KV cache is gone with the worker. With no model
+resubmitted — their KV cache is gone with the worker. With
+`--kv-store vram` the flushed KV *bytes* survive in pooled vRAM, but
+the chunk table (which allocIds belong to which seq/layer) dies with
+the worker, so the replacement still cannot resume the sequence — it
+rejects loudly and the sequence is resubmitted (proven end-to-end by
+`test/kvcache-vram-survival.test.ts`). A pure donor loss, by contrast,
+does not kill the sequence: flushed KV fails over to the surviving
+replica and generation continues. With no model
 active there is nothing to re-plan; a later activation plans over
 whatever workers are alive. If all workers are lost the server waits
 for workers to rejoin.

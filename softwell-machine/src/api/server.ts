@@ -844,7 +844,12 @@ export class SoftwellServer {
    * Drive the scheduler until the sequence finishes, collecting tokens.
    * Returns the generated token ids, the finish reason, and whether the
    * run ended by timeout or by client disconnect. On timeout the sequence
-   * is cancelled before returning.
+   * is cancelled before returning. The scheduler's error message (when
+   * the sequence ends in "error") is returned as errorMessage so the
+   * caller can log and record it — before this, a failed sequence
+   * surfaced only as finish_reason "error" with the cause invisible
+   * (the 2026-11-23 long-prefill failures were undiagnosable until
+   * this was added).
    */
   private async runUntilDone(
     scheduler: Scheduler,
@@ -856,11 +861,13 @@ export class SoftwellServer {
   ): Promise<{
     tokenIds: number[];
     finishReason: string | null;
+    errorMessage: string | null;
     timedOut: boolean;
     disconnected: boolean;
   }> {
     const tokenIds: number[] = [];
     let finishReason: string | null = null;
+    let errorMessage: string | null = null;
     let timedOut = false;
     // Generous safety cap: prefill steps may produce no token for this
     // sequence, so allow well past maxTokens iterations.
@@ -879,6 +886,7 @@ export class SoftwellServer {
       }
       if (seq.status === "error") {
         finishReason = "error";
+        errorMessage = seq.error ?? "sequence errored (no message recorded)";
         break;
       }
       if (isDisconnected()) break;
@@ -903,12 +911,13 @@ export class SoftwellServer {
       }
       if (after !== undefined && after.status === "error") {
         finishReason = "error";
+        errorMessage = after.error ?? "sequence errored (no message recorded)";
         break;
       }
       // Don't busy-spin: yield when a step produced nothing for us.
       if (!produced) await sleep(0);
     }
-    return { tokenIds, finishReason, timedOut, disconnected: isDisconnected() };
+    return { tokenIds, finishReason, errorMessage, timedOut, disconnected: isDisconnected() };
   }
 
   private async streamGeneration(
@@ -979,7 +988,9 @@ export class SoftwellServer {
     }
 
     if (result.finishReason === "error") {
-      this.recordTerminal(active, "error", completionTokens, ttftMs, "sequence error");
+      const message = result.errorMessage ?? "sequence error";
+      console.error(`[api] sequence ${active.seqId} errored: ${message}`);
+      this.recordTerminal(active, "error", completionTokens, ttftMs, message);
     } else {
       this.recordTerminal(active, "done", completionTokens, ttftMs);
     }
@@ -1050,7 +1061,9 @@ export class SoftwellServer {
     }
 
     if (result.finishReason === "error") {
-      this.recordTerminal(active, "error", completionTokens, ttftMs, "sequence error");
+      const message = result.errorMessage ?? "sequence error";
+      console.error(`[api] sequence ${active.seqId} errored: ${message}`);
+      this.recordTerminal(active, "error", completionTokens, ttftMs, message);
     } else {
       this.recordTerminal(active, "done", completionTokens, ttftMs);
     }

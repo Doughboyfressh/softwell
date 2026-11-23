@@ -247,12 +247,128 @@ in `src/` or `test/`, with tests pinning the new behavior.
   vRAM, so a donor loss recovers staged weight pages *plus* vSSD
   mirror pages (`pagesRecovered` 20, not 10, for demo-10m).
 
-## Still not done (2026-11-22)
+## KV cache in pooled vRAM — done (2026-11-23)
 
-- **KV cache is still worker-local host memory.** `VramPagedKVCache`
-  (`src/scheduler/kvcache-vram.ts`) exists with correctness tests, but
-  the serving path still builds `BlockPagedKVCache` per stage load
-  (`src/mesh/worker.ts`); the vRAM KV cache is not wired in.
+The serving path now builds `VramPagedKVCache` behind `--kv-store vram`
+(`softwell serve ... --kv-store vram`, or `SOFTWELL_KV_STORE=vram`;
+the worker accepts `--kv-store host|vram`). The default stays `host`:
+measured full-context reads are ~parity at ctx 128 and ~6–9x at ctx
+1024 (projected decode +75% at ctx 1024 — see the header of
+`src/scheduler/kvcache-vram.ts` and
+`test/kvcache-vram-bench-results-2026-11-22.json`), so vRAM KV is a
+capacity/durability trade until a sub-page read path or in-place vGPU
+attention lands. The plumbing:
+
+- `PagedKVCache` and `StageExecutor.forward()` are async
+  (`src/contracts.ts`); the async bridge the design note chose over a
+  worker-thread bridge (`docs/KV-DESIGN.md` §6).
+- The worker's cache factory receives a `VramAccess | null`
+  (`src/mesh/worker.ts`): `null` for host, a `RemoteVramAccess` over
+  the orchestrator's `POST /mesh/vram/*` endpoints for vRAM
+  (`src/scheduler/kvcache-vram-remote.ts`, `src/server/vram-kv.ts`).
+  The vRAM factory probes the access (one 4 MiB page alloc + free)
+  so unreachable vRAM fails the stage load loudly and keeps the
+  previous stage — no silent fallback (`test/worker-model-switch.test.ts`
+  case 5b pins the rejecting-factory behaviour).
+- Prefill is chunked into 16-row stage-chain executes
+  (`src/scheduler/batch.ts`, `PREFILL_CHUNK_ROWS`): a 997-token prefill
+  takes ~224 s on this host against a 30 s mesh timeout, so the
+  unchunked prefill always timed out and the sequence errored while
+  the worker ground on.
+- **The leak that blocked the long condition.** Finished sequences'
+  KV was never freed: `buildFactory` never passed `freeSequence` to
+  the scheduler, so the default no-op ran and every finished sequence
+  leaked its blocks until the stage reloaded. A 997-token generation
+  consumes 756 of the host cache's 1024 blocks; the next one OOMed
+  with `BlockPagedKVCache out of memory: no free blocks (total=1024,
+  used=1024)` — proven live 2026-11-23 (repro: two 725-token
+  generations back-to-back; the second errored). The vRAM store
+  failed the same way: the short condition's leaked chunks (4
+  sequences × 768 blocks) plus the first long rep (768) left 256 of
+  4096 blocks, so the second long rep OOMed on the cap. The fix is a
+  `POST /mesh/free-sequence {seqId}` route (`src/mesh/protocol.ts`,
+  `MeshClient.freeSequence`), a handler on the worker that frees the
+  live stage cache, and a `freeSequence` in `buildFactory` that fans
+  out to every stage worker (best-effort, `Promise.allSettled`).
+  `test/mesh.test.ts` pins the route (200 + cache freed, idempotent,
+  orchestrator 404s); `test/scheduler.test.ts` pins the scheduler
+  calling it on completion. Two long generations back-to-back now
+  succeed on both stores.
+- Sequence errors are now observable: the API layer used to discard
+  the scheduler's error message and surface only `finish_reason:
+  "error"`. `runUntilDone` (`src/api/server.ts`) returns the message
+  now; it is logged (`[api] sequence <id> errored: ...`) and recorded
+  in the status endpoint's `recentRequests[].error`. That logging is
+  what identified the OOM above.
+
+SURVIVAL CONTRACT — proven end-to-end by
+`test/kvcache-vram-survival.test.ts` (2026-11-23, real donors +
+workers, generation continuing through the kill):
+  - Donor death: flushed KV survives. With replicas=2 a donor dying
+    mid-generation leaves every flushed chunk readable byte-identical
+    before healing (failover) and after `handleNodeLoss` (0 pages
+    lost), and generation continues on the same cache identically. A
+    flush landing while a donor is dead succeeds on the surviving
+    replica (the write drops the dead copy).
+  - Worker death: the sequence must still be resubmitted
+    (re-prefill). The chunk table (which allocIds belong to which
+    seq/layer) lives only in the dead worker's cache instance, so a
+    replacement worker cannot re-attach to flushed chunks — its
+    reads reject loudly — even though the flushed BYTES survive in
+    vRAM byte-identical and even after `flushAll()`. Resuming needs
+    a chunk-table handover (snapshot/attach API) that does not exist
+    yet; until it does, resubmit is the contract.
+  - Staged vs flushed: staged KV (chunk never filled) survives a
+    donor death (host staging) but dies with the worker — it never
+    reached vRAM (its page still reads all zeros). A sequence whose
+    KV is entirely staged behaves exactly like today on worker death.
+    At demo geometry the chunk is 1024 tokens, so a ≤1024-token
+    prompt never flushes: its KV lives in host staging for the whole
+    generation, and the vRAM read cost does not apply to it.
+  - Permanent loss is loud: with replicas=1 a donor death loses
+    pages and reads reject with `VramKvError` (never silent zeros).
+    Note the placement quirk the test pins: single-page chunk
+    allocations all land their only copy on the SAME donor, so
+    killing that donor loses ALL flushed chunks while killing the
+    other loses none. Orphaned chunk allocations also survive a
+    worker death with no owner — nothing frees them yet (no reaper).
+
+### Measured before/after (bench-kv, demo-100m, 1 worker, temp 0, max_tokens 8, medians of 3)
+
+`bench-kv-before.json` (2026-11-23 02:17 UTC), `bench-kv-after-host.json`
+(03:34 UTC), `bench-kv-after.json` (03:56 UTC). Short prompt "Hello
+world" (18 tokens); long prompt is the fox sentence × 22 (997 tokens).
+
+| condition | before (host) | after-host | after-vRAM |
+|---|---|---|---|
+| short TTFT | 6,207 ms (3,645–6,698) | 3,527 ms (3,428–5,102) | 3,819 ms (3,754–5,086) |
+| short decode | 3.95 tok/s (3.07–5.76) | 5.73 tok/s (5.63–5.77) | 5.81 tok/s (5.78–6.12) |
+| long TTFT | — (0/3, all failed) | 228,175 ms (227,117–229,241) | 226,540 ms (225,755–227,292) |
+| long decode | — (0/3) | 4.18 tok/s (3.98–4.31) | 4.12 tok/s (4.05–4.19) |
+| long success | 0/3 | 3/3 | 3/3 |
+
+- **Token identity (P2):** short content is `"CCCCCCCC"` in all 9 runs;
+  long content is 8 identical replacement chars in all 6 successful
+  runs. Host and vRAM produce byte-identical streams.
+- **vRAM vs same-day host (the clean comparison):** short TTFT +8%,
+  decode +1%; long TTFT −1%, decode −1%. Parity, within run noise.
+  Expected: at ≤1024 tokens the KV never flushes (chunk is 1024
+  tokens), so the vRAM read cost does not apply — the prefill
+  dominates and is identical on both stores. The cache-level +75%
+  decode projection at ctx 1024 (flushed chunks) is a different
+  regime and is not what this bench measures.
+- **The before short numbers are not a clean baseline:** the before
+  run ran under loadavg up to 4.16, the after runs under ~1.1–1.5,
+  so the 6,207 → 3,527 ms short TTFT improvement is mostly host load,
+  not the refactor. Do not quote it as a speedup.
+- **The long condition went 0/3 → 3/3 for a different reason than
+  vRAM:** the before failures were the unchunked prefill (one execute
+  vs the 30 s mesh timeout). Chunked prefill fixed rep 1; the
+  `freeSequence` leak fix fixed reps 2–3 (both stores failed 1/3
+  pre-fix for the leak). The long numbers above are post-fix.
+
+## Still not done (2026-11-23)
+
 - **Activation transport is still JSON.** Stage inputs travel as
   `ExecuteRequest.input: { data: number[]; shape: number[] }` over
   `POST /mesh/execute`. Only weights (and vRAM page transfers) are

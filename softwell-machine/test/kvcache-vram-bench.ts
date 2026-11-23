@@ -256,11 +256,11 @@ async function main(): Promise<void> {
       {
         const cache = hostCache();
         await fillLayer(cache, "s", 0, ctx);
-        cache.read("s", 0, prefix(ctx)); // warmup
+        await cache.read("s", 0, prefix(ctx)); // warmup
         const times: number[] = [];
         for (let run = 0; run < 5; run++) {
           const t0 = performance.now();
-          cache.read("s", 0, prefix(ctx));
+          await cache.read("s", 0, prefix(ctx));
           times.push(performance.now() - t0);
         }
         note(`host_read_ms_ctx${ctx}_1layer`, median(times));
@@ -300,7 +300,7 @@ async function main(): Promise<void> {
         const times: number[] = [];
         for (let run = 0; run < 5; run++) {
           const t0 = performance.now();
-          for (let layer = 0; layer < LAYERS; layer++) cache.read("s", layer, prefix(ctx));
+          for (let layer = 0; layer < LAYERS; layer++) await cache.read("s", layer, prefix(ctx));
           times.push(performance.now() - t0);
         }
         note(`host_read_ms_ctx${ctx}_12layers`, median(times));
@@ -357,7 +357,7 @@ async function main(): Promise<void> {
       for (let i = 1; i < ctx; i++) prompt.push(i % 259);
       const embedded = executor.embed(prompt);
       const tPrefill0 = performance.now();
-      const logits = executor.forward(embedded, {
+      const logits = await executor.forward(embedded, {
         seqIds: prompt.map(() => "s"),
         positions: prompt.map((_, i) => i),
         isPrefill: true,
@@ -373,7 +373,7 @@ async function main(): Promise<void> {
         const tok = sampleLogits(lastLogits, greedy);
         const emb = executor.embed([tok]);
         const t0 = performance.now();
-        const out = executor.forward(emb, {
+        const out = await executor.forward(emb, {
           seqIds: ["s"],
           positions: [ctx + step],
           isPrefill: false,
@@ -421,7 +421,7 @@ async function main(): Promise<void> {
         const dTimes: number[] = [];
         for (let step = 0; step < 3; step++) {
           const d0 = performance.now();
-          const out = executor.forward(emb, {
+          const out = await executor.forward(emb, {
             seqIds: ["s"],
             positions: [1024 + step],
             isPrefill: false,

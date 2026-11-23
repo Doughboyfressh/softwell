@@ -291,7 +291,7 @@ export class TransformerStageExecutor implements StageExecutor {
     return { data, shape: [tokenIds.length, hidden] };
   }
 
-  forward(input: Tensor, ctx: ForwardContext): Tensor {
+  async forward(input: Tensor, ctx: ForwardContext): Promise<Tensor> {
     if (!this.loaded) throw new Error("TransformerStageExecutor.forward: load() has not been called");
     const cfg = this.manifest.config;
     const hidden = cfg.hiddenSize;
@@ -320,7 +320,7 @@ export class TransformerStageExecutor implements StageExecutor {
     for (let layerIdx = this.assignment.layerStart; layerIdx < this.assignment.layerEnd; layerIdx++) {
       const layer = this.layers.get(layerIdx);
       if (!layer) throw new Error(`forward: layer ${layerIdx} weights not loaded`);
-      x = this.forwardLayer(x, rows, layer, layerIdx, ctx, order);
+      x = await this.forwardLayer(x, rows, layer, layerIdx, ctx, order);
     }
 
     if (this.assignment.hasLmHead) {
@@ -496,7 +496,7 @@ export class TransformerStageExecutor implements StageExecutor {
    * prefix is longer than their prompt in this batch (a continued
    * prefill, not a fresh one) fall back to the per-row path.
    */
-  private attendPrefillNovel(
+  private async attendPrefillNovel(
     q: Float32Array,
     k: Float32Array,
     v: Float32Array,
@@ -505,7 +505,7 @@ export class TransformerStageExecutor implements StageExecutor {
     ctx: ForwardContext,
     order: number[],
     attnOut: Float32Array,
-  ): void {
+  ): Promise<void> {
     const cfg = this.manifest.config;
     const hidden = cfg.hiddenSize;
     const numHeads = cfg.numAttentionHeads;
@@ -537,7 +537,7 @@ export class TransformerStageExecutor implements StageExecutor {
         applyRope(qRow, kRow, [pos], numHeads, headDim, cfg.ropeTheta, numKvHeads);
         qSeq.set(qRow, j * qDim);
         this.noteAppend(seqId, layerIdx, pos);
-        ctx.cache.append(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
+        await ctx.cache.append(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
         this.noteAppendedKv(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
       }
       const lastPos = positions[n - 1] as number;
@@ -551,7 +551,7 @@ export class TransformerStageExecutor implements StageExecutor {
           const pos = ctx.positions[r] as number;
           const rowPrefix: number[] = [];
           for (let p = 0; p <= pos; p++) rowPrefix.push(p);
-          const { keys, values } = ctx.cache.read(seqId, layerIdx, rowPrefix);
+          const { keys, values } = await ctx.cache.read(seqId, layerIdx, rowPrefix);
           const headOut = this.attendRow(
             q.subarray(r * qDim, (r + 1) * qDim),
             keys,
@@ -568,7 +568,7 @@ export class TransformerStageExecutor implements StageExecutor {
         }
         continue;
       }
-      const { keys, values } = ctx.cache.read(seqId, layerIdx, prefix);
+      const { keys, values } = await ctx.cache.read(seqId, layerIdx, prefix);
       const result =
         this.engineOptions.attention === "landmark"
           ? prefillLandmarkAttention(qSeq, keys, values, numHeads, numKvHeads, headDim)
@@ -585,14 +585,14 @@ export class TransformerStageExecutor implements StageExecutor {
   }
 
   /** One transformer layer over all rows; `order` is the per-sequence row order. */
-  private forwardLayer(
+  private async forwardLayer(
     x: Float32Array,
     rows: number,
     layer: LayerWeights,
     layerIdx: number,
     ctx: ForwardContext,
     order: number[],
-  ): Float32Array {
+  ): Promise<Float32Array> {
     const cfg = this.manifest.config;
     const hidden = cfg.hiddenSize;
     const numHeads = cfg.numAttentionHeads;
@@ -627,7 +627,7 @@ export class TransformerStageExecutor implements StageExecutor {
     const usePrefillNovel =
       ctx.isPrefill && this.engineOptions.attention !== "exact" && this.engineOptions.kvFormat === "fp32";
     if (usePrefillNovel) {
-      this.attendPrefillNovel(q, k, v, layer, layerIdx, ctx, order, attnOut);
+      await this.attendPrefillNovel(q, k, v, layer, layerIdx, ctx, order, attnOut);
     } else {
       // GQA attention, one row at a time (per-sequence order).
       for (const r of order) {
@@ -646,9 +646,9 @@ export class TransformerStageExecutor implements StageExecutor {
 
         // Append this row's K/V to the cache, then read the prefix back.
         this.noteAppend(seqId, layerIdx, pos);
-        ctx.cache.append(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
+        await ctx.cache.append(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
         this.noteAppendedKv(seqId, layerIdx, pos, kRow, v.subarray(r * kvDim, (r + 1) * kvDim));
-        const { keys, values } = ctx.cache.read(seqId, layerIdx, prefix);
+        const { keys, values } = await ctx.cache.read(seqId, layerIdx, prefix);
 
         const headOut = this.attendRow(qRow, keys, values, seqId, layerIdx, pos, prefix);
         const projected =

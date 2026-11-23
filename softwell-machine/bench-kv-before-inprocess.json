@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-23T02:28:12.541Z",
+  "machine": "Machine: AMD EPYC 9D25 126-Core Processor (4 cores), 7.7 GiB RAM, Node v24.22.1, linux x64",
+  "node": "v24.22.1",
+  "rows": [
+    {
+      "part": "model",
+      "workload": "demo-100m",
+      "promptLen": 18,
+      "config": "baseline",
+      "ttftMs": 3518.1102690000007,
+      "decodeMs": 1349.7216129999997,
+      "tokens": 8,
+      "forwards": 8,
+      "rowsProcessed": 25,
+      "acceptanceRate": 0,
+      "tokensPerSec": 5.927148178518499,
+      "msPerToken": 168.71520162499996,
+      "loadMs": 2462.77191,
+      "weightBytes": 417460224,
+      "notes": "baseline on demo-100m (prompt 18, 8 tokens): TTFT 3518 ms, decode 1350 ms (5.93 tok/s), 8 forwards / 25 rows"
+    },
+    {
+      "part": "model",
+      "workload": "demo-100m",
+      "promptLen": 997,
+      "config": "baseline",
+      "ttftMs": 224101.315613,
+      "decodeMs": 1984.0558270000038,
+      "tokens": 8,
+      "forwards": 8,
+      "rowsProcessed": 1004,
+      "acceptanceRate": 0,
+      "tokensPerSec": 4.032144605576154,
+      "msPerToken": 248.00697837500047,
+      "loadMs": 1250.0616320000008,
+      "weightBytes": 417460224,
+      "notes": "baseline on demo-100m (prompt 997, 8 tokens): TTFT 224101 ms, decode 1984 ms (4.03 tok/s), 8 forwards / 1004 rows"
+    }
+  ]
+}

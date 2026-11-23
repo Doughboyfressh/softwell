@@ -77,14 +77,14 @@ import { argmax, mulberry32 } from "./sampling.ts";
 // ---------------------------------------------------------------------------
 
 /** One batched forward: embed `tokenIds`, run the stage, return logits. */
-export function forwardTokenRows(
+export async function forwardTokenRows(
   executor: StageExecutor,
   cache: PagedKVCache,
   seqId: string,
   tokenIds: number[],
   positions: number[],
   isPrefill: boolean,
-): Tensor {
+): Promise<Tensor> {
   const embedded = executor.embed(tokenIds);
   const ctx: ForwardContext = { seqIds: tokenIds.map(() => seqId), positions, isPrefill, cache };
   return executor.forward(embedded, ctx);
@@ -454,16 +454,16 @@ export class AutoregressiveDecoder {
     this.opts = opts;
   }
 
-  generate(maxTokens?: number): GenerateResult {
+  async generate(maxTokens?: number): Promise<GenerateResult> {
     const { executor, cache, seqId, promptTokenIds, sampling, vocabSize, eosTokenId } = this.opts;
     const limit = maxTokens ?? sampling.maxTokens;
     const result = emptyResult();
     if (limit <= 0) return result;
     const rng = makeRng(sampling.seed);
-    cache.free(seqId);
+    await cache.free(seqId);
     const promptLen = promptTokenIds.length;
     const positions = promptTokenIds.map((_, i) => i);
-    const prefill = forwardTokenRows(executor, cache, seqId, promptTokenIds, positions, true);
+    const prefill = await forwardTokenRows(executor, cache, seqId, promptTokenIds, positions, true);
     result.forwards += 1;
     result.rowsProcessed += promptLen;
     let pending = logitsRow(prefill, promptLen - 1, vocabSize);
@@ -476,7 +476,7 @@ export class AutoregressiveDecoder {
       }
       if (result.tokens.length >= limit) break;
       const pos = promptLen + result.tokens.length - 1;
-      const out = forwardTokenRows(executor, cache, seqId, [tok], [pos], false);
+      const out = await forwardTokenRows(executor, cache, seqId, [tok], [pos], false);
       result.forwards += 1;
       result.rowsProcessed += 1;
       pending = logitsRow(out, 0, vocabSize);
@@ -511,17 +511,17 @@ export class SpeculativeDecoder {
     this.drafter = opts.drafter ?? new NGramDrafter(8);
   }
 
-  generate(maxTokens?: number): GenerateResult {
+  async generate(maxTokens?: number): Promise<GenerateResult> {
     const { executor, cache, seqId, promptTokenIds, sampling, vocabSize, eosTokenId } = this.opts;
     const limit = maxTokens ?? sampling.maxTokens;
     const result = emptyResult();
     if (limit <= 0) return result;
     const rng = makeRng(sampling.seed);
     const promptLen = promptTokenIds.length;
-    cache.free(seqId);
+    await cache.free(seqId);
 
     // Prefill: logits for the first generated token.
-    const prefill = forwardTokenRows(
+    const prefill = await forwardTokenRows(
       executor,
       cache,
       seqId,
@@ -567,14 +567,14 @@ export class SpeculativeDecoder {
           // drafter that declines to propose). Exact by construction.
           if (!pushToken(sampleTarget(pending, sampling, rng))) break;
           const pos = promptLen + result.tokens.length - 1;
-          const out = forwardTokenRows(executor, cache, seqId, [result.tokens[result.tokens.length - 1] as number], [pos], false);
+          const out = await forwardTokenRows(executor, cache, seqId, [result.tokens[result.tokens.length - 1] as number], [pos], false);
           result.forwards += 1;
           result.rowsProcessed += 1;
           pending = logitsRow(out, 0, vocabSize);
           continue;
         }
         const positions = draft.map((_, i) => nextPos + i);
-        const out = forwardTokenRows(executor, cache, seqId, draft, positions, false);
+        const out = await forwardTokenRows(executor, cache, seqId, draft, positions, false);
         result.forwards += 1;
         result.rowsProcessed += draft.length;
         // Verify draft[i] against the logits that predict it: pending for
@@ -632,7 +632,7 @@ export class SpeculativeDecoder {
         const draft = this.drafter.draft(context(), k);
         const rows = [carryToken, ...draft];
         const positions = rows.map((_, i) => carryPos + i);
-        const out = forwardTokenRows(executor, cache, seqId, rows, positions, false);
+        const out = await forwardTokenRows(executor, cache, seqId, rows, positions, false);
         result.forwards += 1;
         result.rowsProcessed += rows.length;
         if (draft.length === 0) {
@@ -726,15 +726,15 @@ export class JacobiDecoder {
     this.drafter = opts.drafter ?? new NGramDrafter(8);
   }
 
-  generate(maxTokens?: number): GenerateResult {
+  async generate(maxTokens?: number): Promise<GenerateResult> {
     const { executor, cache, seqId, promptTokenIds, vocabSize, eosTokenId } = this.opts;
     const limit = maxTokens ?? this.opts.sampling.maxTokens;
     const result = emptyResult();
     if (limit <= 0) return result;
     const promptLen = promptTokenIds.length;
-    cache.free(seqId);
+    await cache.free(seqId);
 
-    const prefill = forwardTokenRows(
+    const prefill = await forwardTokenRows(
       executor,
       cache,
       seqId,
@@ -770,7 +770,7 @@ export class JacobiDecoder {
         const tok = argmax(pending);
         if (!pushToken(tok)) break;
         if (result.tokens.length >= limit) break;
-        const out = forwardTokenRows(executor, cache, seqId, [tok], [nextPos], false);
+        const out = await forwardTokenRows(executor, cache, seqId, [tok], [nextPos], false);
         result.forwards += 1;
         result.rowsProcessed += 1;
         pending = logitsRow(out, 0, vocabSize);
@@ -790,7 +790,7 @@ export class JacobiDecoder {
       for (let iter = 0; iter < blockLen; iter++) {
         result.iterations += 1;
         const positions = guess.map((_, i) => nextPos + i);
-        out = forwardTokenRows(executor, cache, seqId, guess, positions, false);
+        out = await forwardTokenRows(executor, cache, seqId, guess, positions, false);
         result.forwards += 1;
         result.rowsProcessed += guess.length;
         const refined: number[] = [argmax(pending)];
@@ -810,7 +810,7 @@ export class JacobiDecoder {
         // One commit forward feeds the correct tokens, repairing those
         // slots and yielding the logits for the next block.
         const positions = guess.map((_, i) => nextPos + i);
-        out = forwardTokenRows(executor, cache, seqId, guess, positions, false);
+        out = await forwardTokenRows(executor, cache, seqId, guess, positions, false);
         result.forwards += 1;
         result.rowsProcessed += guess.length;
       }

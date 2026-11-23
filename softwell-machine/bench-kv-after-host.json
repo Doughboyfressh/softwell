@@ -1,0 +1,255 @@
+{
+  "label": "after-host",
+  "date": "2026-11-23T03:34:39.291Z",
+  "model": "demo-100m",
+  "params": 104365056,
+  "workers": 1,
+  "mesh_port": 18512,
+  "api_port": 18522,
+  "kv_cache": "host BlockPagedKVCache (block size 16) — vRAM cache NOT wired in",
+  "max_tokens": 8,
+  "temperature": 0,
+  "host": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 4,
+    "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+    "total_mem_mib": 7934,
+    "free_mem_mib": 2671,
+    "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        5263        2376          54         596        2670\nSwap:           1023         414         609",
+    "loadavg": [
+      0.69,
+      1.22,
+      1.28
+    ]
+  },
+  "conditions": {
+    "short": {
+      "prompt": "Hello world",
+      "prompt_construction": {
+        "content": "Hello world",
+        "expected_prompt_tokens": 18
+      },
+      "prompt_tokens_measured": 18,
+      "prompt_tokens_probe_error": null,
+      "host_before_condition": {
+        "node": "v24.22.1",
+        "platform": "linux",
+        "arch": "x64",
+        "cpus": 4,
+        "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+        "total_mem_mib": 7934,
+        "free_mem_mib": 421,
+        "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        7513         145          23         545         420\nSwap:           1023         461         562",
+        "loadavg": [
+          1.11,
+          1.26,
+          1.29
+        ]
+      },
+      "runs": [
+        {
+          "rep": 1,
+          "ttft_ms": 5102,
+          "decode_tok_per_s": 5.63,
+          "total_ms": 6522,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        },
+        {
+          "rep": 2,
+          "ttft_ms": 3527,
+          "decode_tok_per_s": 5.77,
+          "total_ms": 4914,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        },
+        {
+          "rep": 3,
+          "ttft_ms": 3428,
+          "decode_tok_per_s": 5.73,
+          "total_ms": 4823,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        }
+      ],
+      "summary": {
+        "median_ttft_ms": 3527,
+        "ttft_ms_range": [
+          3428,
+          5102
+        ],
+        "median_decode_tok_per_s": 5.73,
+        "decode_tok_per_s_range": [
+          5.63,
+          5.77
+        ],
+        "median_total_ms": 4914,
+        "total_ms_range": [
+          4823,
+          6522
+        ],
+        "successful_runs": 3,
+        "failed_runs": 0
+      }
+    },
+    "long": {
+      "prompt_construction": {
+        "sentence": "The quick brown fox jumps over the lazy dog. ",
+        "repeats": 22,
+        "content_chars": 990,
+        "content_bytes": 990,
+        "expected_prompt_tokens": 997
+      },
+      "prompt_tokens_measured": 997,
+      "prompt_tokens_probe_error": null,
+      "host_before_condition": {
+        "node": "v24.22.1",
+        "platform": "linux",
+        "arch": "x64",
+        "cpus": 4,
+        "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+        "total_mem_mib": 7934,
+        "free_mem_mib": 373,
+        "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        7562         171          39         487         371\nSwap:           1023         427         596",
+        "loadavg": [
+          1.14,
+          1.4,
+          1.36
+        ]
+      },
+      "runs": [
+        {
+          "rep": 1,
+          "ttft_ms": 228175,
+          "decode_tok_per_s": 4.18,
+          "total_ms": 230091,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "��������"
+        },
+        {
+          "rep": 2,
+          "ttft_ms": 227117,
+          "decode_tok_per_s": 3.98,
+          "total_ms": 229126,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "��������"
+        },
+        {
+          "rep": 3,
+          "ttft_ms": 229241,
+          "decode_tok_per_s": 4.31,
+          "total_ms": 231096,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "��������"
+        }
+      ],
+      "summary": {
+        "median_ttft_ms": 228175,
+        "ttft_ms_range": [
+          227117,
+          229241
+        ],
+        "median_decode_tok_per_s": 4.18,
+        "decode_tok_per_s_range": [
+          3.98,
+          4.31
+        ],
+        "median_total_ms": 230091,
+        "total_ms_range": [
+          229126,
+          231096
+        ],
+        "successful_runs": 3,
+        "failed_runs": 0
+      }
+    }
+  },
+  "server_status": {
+    "state": "ready",
+    "uptimeSec": 0.486,
+    "activeModelId": "demo-100m",
+    "models": [
+      {
+        "id": "demo-100m",
+        "source": {
+          "kind": "local",
+          "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m"
+        },
+        "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m",
+        "status": "ready",
+        "vramBytes": 417473018,
+        "requestsServed": 0,
+        "tokensGenerated": 0,
+        "params": 104365056,
+        "weightBytes": 417460224,
+        "numLayers": 12,
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "tokenizerKind": "byte-level",
+        "weightVaddr": 0,
+        "loadedAt": 1795404911093
+      }
+    ],
+    "requests": {
+      "active": 0,
+      "queued": 0,
+      "completed": 0,
+      "rejected": 0,
+      "cancelled": 0
+    },
+    "tokensPerSec": 0,
+    "queueDepth": 0,
+    "vm": {
+      "vram": {
+        "totalBytes": 8589934592,
+        "usedBytes": 1107296256,
+        "freeBytes": 7482638336,
+        "pages": 264,
+        "nodes": 1
+      },
+      "gpu": {
+        "devices": [
+          {
+            "nodeId": "worker-mwsppq47-ba1ctn8m",
+            "device": "cpu",
+            "flopsPerSec": 1534045621.9626853
+          }
+        ],
+        "totalFlopsPerSec": 1534045621.9626853,
+        "kernelsCompleted": 0,
+        "kernelsFailed": 0
+      },
+      "cpu": {
+        "nodes": 1,
+        "totalCores": 4,
+        "queued": 0,
+        "completed": 0,
+        "failed": 0,
+        "nodesReportingCores": 1,
+        "nodesAssumedCores": 0
+      },
+      "ssd": {
+        "objects": 6,
+        "totalBytes": 457224554,
+        "nodes": 1
+      },
+      "nodes": [
+        {
+          "nodeId": "worker-mwsppq47-ba1ctn8m",
+          "device": "cpu",
+          "state": "healthy"
+        }
+      ]
+    },
+    "recentRequests": []
+  }
+}

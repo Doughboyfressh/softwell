@@ -377,9 +377,9 @@ class TimingExecutor implements StageExecutor {
     return this.inner.embed(tokenIds);
   }
 
-  forward(input: Tensor, ctx: ForwardContext): Tensor {
+  async forward(input: Tensor, ctx: ForwardContext): Promise<Tensor> {
     const t0 = performance.now();
-    const out = this.inner.forward(input, ctx);
+    const out = await this.inner.forward(input, ctx);
     const ms = performance.now() - t0;
     if (ctx.isPrefill) {
       this.prefillMs += ms;
@@ -434,7 +434,7 @@ async function runModelConfig(
   // Warmup (same executor, scratch cache/seqId): pays JIT + first-touch
   // costs so the timed run measures steady-state, not warmup.
   const warmCache = new BlockPagedKVCache(16, 4096, manifest.config.numKeyValueHeads, manifest.config.headDim);
-  new AutoregressiveDecoder({
+  await new AutoregressiveDecoder({
     executor,
     cache: warmCache,
     seqId: `warm-${model.id}-${configName}`,
@@ -466,11 +466,11 @@ async function runModelConfig(
   };
   let result;
   if (decoding === "speculative") {
-    result = new SpeculativeDecoder({ ...decoderOpts, draftLength: 4 }).generate();
+    result = await new SpeculativeDecoder({ ...decoderOpts, draftLength: 4 }).generate();
   } else if (decoding === "jacobi") {
-    result = new JacobiDecoder({ ...decoderOpts, blockSize: 4 }).generate();
+    result = await new JacobiDecoder({ ...decoderOpts, blockSize: 4 }).generate();
   } else {
-    result = new AutoregressiveDecoder(decoderOpts).generate();
+    result = await new AutoregressiveDecoder(decoderOpts).generate();
   }
   const ttftMs = executor.prefillMs;
   const decodeMs = executor.decodeMs;

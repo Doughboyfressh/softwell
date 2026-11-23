@@ -9,7 +9,9 @@
  *    after HEARTBEAT_DEAD_MS
  *  - a worker process object (startWorker) with a fake echo backend:
  *    registers, heartbeats, picks up its assignment, and executes one
- *    fake stage through POST /mesh/execute
+ *    fake stage through POST /mesh/execute, then releases a sequence's
+ *    KV through POST /mesh/free-sequence (the scheduler's freeSequence
+ *    path; the orchestrator 404s it)
  */
 import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
@@ -89,13 +91,19 @@ function makeLoader(): WeightLoader {
   };
 }
 
+/** seqIds the fake cache's free() was called with (per stage load). */
+const freedSeqIds: string[] = [];
+
 function makeCache(_manifest: ModelManifest): PagedKVCache {
   return {
     blockSize: 16,
-    allocate: () => [],
-    append: () => {},
-    read: () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
-    free: () => {},
+    allocate: async () => [],
+    append: async () => {},
+    read: async () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
+    free: async (seqId: string) => {
+      freedSeqIds.push(seqId);
+    },
+    close: async () => {},
     usedBlocks: () => 0,
     totalBlocks: () => 0,
   };
@@ -113,7 +121,7 @@ function makeEchoBackend(): EngineBackend {
           data: new Float32Array(tokenIds.length * 2),
           shape: [tokenIds.length, 2],
         }),
-        forward: (input: Tensor, _ctx: ForwardContext): Tensor => input,
+        forward: async (input: Tensor, _ctx: ForwardContext): Promise<Tensor> => input,
         memoryBytes: () => 4096,
       };
     },
@@ -277,6 +285,20 @@ async function main(): Promise<void> {
     assert.deepEqual(execResp.output, { data: [1, 2, 3, 4], shape: [2, 2] });
     assert.equal(execResp.isLogits, false);
     assert.equal(execResp.tokensProcessed, 2);
+
+    // POST /mesh/free-sequence releases the sequence's KV on the worker
+    // (the scheduler's freeSequence path — without it the cache leaked
+    // every finished sequence until the stage reloaded, 2026-11-23).
+    const freed = await client.freeSequence(workerUrl, "seq-1");
+    assert.deepEqual(freed, { freed: true });
+    assert.ok(freedSeqIds.includes("seq-1"), "free must reach the stage cache");
+    // Idempotent: freeing an unknown seqId still answers 200.
+    assert.deepEqual(await client.freeSequence(workerUrl, "seq-never-seen"), { freed: true });
+    // The orchestrator server has no freeSequence handler: 404.
+    await assert.rejects(
+      client.freeSequence(orchUrl, "seq-1"),
+      (err: unknown) => err instanceof MeshError && err.status === 404,
+    );
 
     // The orchestrator server must not execute: 404, as a typed MeshError.
     await assert.rejects(

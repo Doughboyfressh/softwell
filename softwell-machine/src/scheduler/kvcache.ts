@@ -69,7 +69,7 @@ export class BlockPagedKVCache implements PagedKVCache {
    * full block table for that layer (physical block ids, in order).
    * Throws on out-of-memory (no free blocks).
    */
-  allocate(seqId: string, layer: number, numTokens: number): number[] {
+  async allocate(seqId: string, layer: number, numTokens: number): Promise<number[]> {
     if (!Number.isInteger(numTokens) || numTokens < 0) {
       throw new Error(`BlockPagedKVCache.allocate: numTokens must be a non-negative integer, got ${numTokens}`);
     }
@@ -98,7 +98,7 @@ export class BlockPagedKVCache implements PagedKVCache {
   }
 
   /** Write one token's K/V for `layer` at absolute `position`. */
-  append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): void {
+  async append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): Promise<void> {
     if (!Number.isInteger(position) || position < 0) {
       throw new Error(`BlockPagedKVCache.append: position must be a non-negative integer, got ${position}`);
     }
@@ -110,7 +110,7 @@ export class BlockPagedKVCache implements PagedKVCache {
       );
     }
     // Grow the table so the block for this position exists.
-    const table = this.allocate(seqId, layer, position + 1);
+    const table = await this.allocate(seqId, layer, position + 1);
     const blockIndex = Math.floor(position / this.blockSize);
     const offsetInBlock = position % this.blockSize;
     const blockId = table[blockIndex] as number;
@@ -134,7 +134,7 @@ export class BlockPagedKVCache implements PagedKVCache {
    * Concatenated K and V for `positions` (in the requested order) for one
    * layer. Each returned array has shape [positions.length, kvDim].
    */
-  read(seqId: string, layer: number, positions: number[]): { keys: Float32Array; values: Float32Array } {
+  async read(seqId: string, layer: number, positions: number[]): Promise<{ keys: Float32Array; values: Float32Array }> {
     const perLayer = this.tables.get(seqId);
     const table = perLayer?.get(layer);
     if (table === undefined) {
@@ -171,7 +171,7 @@ export class BlockPagedKVCache implements PagedKVCache {
   }
 
   /** Release every block owned by `seqId`, across all layers. No-op if unknown. */
-  free(seqId: string): void {
+  async free(seqId: string): Promise<void> {
     const perLayer = this.tables.get(seqId);
     if (perLayer === undefined) return;
     for (const table of perLayer.values()) {
@@ -184,6 +184,21 @@ export class BlockPagedKVCache implements PagedKVCache {
       }
     }
     this.tables.delete(seqId);
+  }
+
+  /** Release everything: all sequences, all blocks back on the free-list. */
+  async close(): Promise<void> {
+    for (const perLayer of this.tables.values()) {
+      for (const table of perLayer.values()) {
+        for (const blockId of table) {
+          const block = this.blocks[blockId] as Block;
+          block.keysByLayer.clear();
+          block.valuesByLayer.clear();
+          this.freeList.push(blockId);
+        }
+      }
+    }
+    this.tables.clear();
   }
 
   usedBlocks(): number {

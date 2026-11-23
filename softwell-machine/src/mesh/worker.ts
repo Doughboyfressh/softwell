@@ -6,9 +6,12 @@ import { parseEngineFlags } from "../engine/options.ts";
 import { openWeightLoader } from "../model/loader.ts";
 import { VramWeightLoader } from "../model/vram-loader.ts";
 import { BlockPagedKVCache } from "../scheduler/kvcache.ts";
+import { VramPagedKVCache } from "../scheduler/kvcache-vram.ts";
+import { RemoteVramAccess } from "../scheduler/kvcache-vram-remote.ts";
 import {
   DEFAULT_ORCHESTRATOR_PORT,
   HEARTBEAT_INTERVAL_MS,
+  VRAM_PAGE_SIZE_BYTES,
 } from "../contracts.ts";
 import type {
   EngineBackend,
@@ -20,6 +23,7 @@ import type {
   ShardAssignment,
   StageExecutor,
   Tensor,
+  VramAccess,
   WeightLoader,
   WorkerCapability,
   WorkerDevice,
@@ -51,8 +55,25 @@ export interface StartWorkerOptions {
   /** Factory for the worker-local PagedKVCache (scheduler's implementation).
    *  Required. It receives the manifest of the model the stage was just
    *  loaded from, so the cache is built from that model's GQA geometry —
-   *  the geometry changes when the worker switches models. */
-  createCache: (manifest: ModelManifest) => PagedKVCache;
+   *  the geometry changes when the worker switches models — and the
+   *  worker's vRAM access (or `null` when the worker runs with the host
+   *  store). The access is passed explicitly rather than closed over, so
+   *  tests can inject a fake access (or `null`) without reaching into the
+   *  worker's construction scope. The factory may be async: a vRAM-mode
+   *  factory probes the access (one alloc + free) so an unreachable vRAM
+   *  fails the stage load loudly instead of failing every sequence's
+   *  first append; `loadAssignment` awaits it either way. */
+  createCache: (manifest: ModelManifest, vram: VramAccess | null) => PagedKVCache | Promise<PagedKVCache>;
+  /**
+   * The worker's vRAM access for KV pages, or `null` when the worker
+   * runs with the host store. Provided by the caller (the CLI builds a
+   * `RemoteVramAccess` from the orchestrator URL when `--kv-store vram`
+   * is selected). Passed to `createCache` as its second argument.
+   * There is deliberately no runtime fallback: a `vram` worker whose
+   * access is null or unreachable fails its stage load loudly and
+   * keeps the previous stage (docs/KV-DESIGN.md §5).
+   */
+  vramAccess?: VramAccess | null;
   pollIntervalMs?: number;
   /**
    * Optional virtual-hardware node server factory. When provided it is
@@ -70,6 +91,32 @@ export interface WorkerHandle {
   port: number;
   hwPort?: number;
   close(): Promise<void>;
+}
+
+/**
+ * Whether two assignments describe the same stage for this worker:
+ * same stage, layers, embedding/lm_head, model, and sharding. The
+ * assignment version is a global counter and is deliberately NOT
+ * compared — a re-plan that touches only another worker bumps it.
+ * loadAssignment uses this to skip a reload that would drop the
+ * worker's in-flight KV for no reason.
+ */
+function sameAssignment(a: ShardAssignment, b: ShardAssignment): boolean {
+  return (
+    a.workerId === b.workerId &&
+    a.stage === b.stage &&
+    a.layerStart === b.layerStart &&
+    a.layerEnd === b.layerEnd &&
+    a.hasEmbedding === b.hasEmbedding &&
+    a.hasLmHead === b.hasLmHead &&
+    a.tensorParallelRank === b.tensorParallelRank &&
+    a.tensorParallelSize === b.tensorParallelSize &&
+    a.modelId === b.modelId &&
+    a.modelDir === b.modelDir &&
+    a.estimatedMemoryBytes === b.estimatedMemoryBytes &&
+    a.experts.length === b.experts.length &&
+    a.experts.every((e, i) => e === b.experts[i])
+  );
 }
 
 export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandle> {
@@ -200,6 +247,25 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
         knownVersion = resp.version;
         return true;
       }
+      // The version is a GLOBAL counter: a re-plan that touches only
+      // another worker still bumps it, so a version change alone must
+      // not reload this worker's stage. A reload builds a fresh KV
+      // cache and drops this worker's in-flight sequences' KV — so a
+      // worker death would silently kill every sequence on every
+      // survivor, not just the dead worker's. Only reload when THIS
+      // worker's assignment actually changed; otherwise just advance
+      // the versions. (Found by the KV survival e2e test: without
+      // this, the survivor reloaded on the re-plan's version bump and
+      // its KV loss masked the replacement's loud rejection.)
+      if (
+        executor !== null &&
+        loadedAssignment !== null &&
+        sameAssignment(loadedAssignment, resp.assignment)
+      ) {
+        loadedVersion = resp.version;
+        knownVersion = resp.version;
+        return true;
+      }
       // Resolve the loader BEFORE building the stage. A model dir that
       // cannot be opened leaves the old executor, cache, assignment and
       // versions untouched — and knownVersion deliberately NOT advanced,
@@ -212,8 +278,24 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
         opts.engineOptions,
       );
       await next.load(loader);
+      // Build the new cache BEFORE touching the live stage: if the
+      // factory rejects (e.g. a vram worker whose vRAM is unreachable —
+      // the probe in the CLI factory), the old executor, cache,
+      // assignment and versions stay untouched and the next poll retries.
+      // Then release the old cache (its vRAM chunks return to the pool;
+      // for the host cache this is a no-op reset) before installing the
+      // new stage, so a model switch cannot leak chunks.
+      const nextCache = await opts.createCache(loader.manifest, opts.vramAccess ?? null);
+      const oldCache = cache;
+      if (oldCache !== null) {
+        await oldCache.close().catch((err) => {
+          log(
+            `failed to release previous KV cache: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
       executor = next;
-      cache = opts.createCache(loader.manifest);
+      cache = nextCache;
       currentLoader = loader;
       // The cache key of the loader actually used: the spawn loader's
       // manifest id when the assignment carries no modelDir (v1 behaviour),
@@ -276,7 +358,7 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
           shape: [...req.input.shape],
         };
       }
-      const output = stageExecutor.forward(input, {
+      const output = await stageExecutor.forward(input, {
         seqIds: [...req.seqIds],
         positions: [...req.positions],
         isPrefill: req.kind === "prefill",
@@ -296,7 +378,22 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
 
   // 1. Serve /mesh/execute on our own port first, so we know the real port
   //    (port 0 = ephemeral) before registering.
-  server = createMeshServer({ execute: executeHandler });
+  server = createMeshServer({
+    execute: executeHandler,
+    // The scheduler frees a finished sequence's KV through here; the
+    // cache is read at call time (the live stage's cache, not a
+    // captured one). No stage loaded yet -> nothing to free (200,
+    // freed false); freeing an unknown seqId is a no-op in both
+    // caches, so this is idempotent. Without this route the cache
+    // leaked every finished sequence (2026-11-23: 997-token generations
+    // OOMed the second one on the 1024-block host cache).
+    freeSequence: async (seqId: string): Promise<{ freed: boolean }> => {
+      const currentCache = cache;
+      if (currentCache === null) return { freed: false };
+      await currentCache.free(seqId);
+      return { freed: true };
+    },
+  });
   const actualPort: number = await new Promise<number>((resolve, reject) => {
     const onError = (err: Error): void => reject(err);
     server?.once("error", onError);
@@ -391,6 +488,13 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       await hwServer.close().catch(() => undefined);
       hwServer = undefined;
     }
+    // Release the stage's KV cache: for a vRAM-backed cache this flushes
+    // staged chunks and returns every chunk to the pool (best-effort —
+    // a failing close must not fail shutdown).
+    if (cache !== null) {
+      await cache.close().catch(() => undefined);
+      cache = null;
+    }
     // Loaders are never evicted while the worker runs; close them all now
     // (including the spawn-time loader seeded in the cache).
     for (const loader of loaders.values()) {
@@ -457,12 +561,33 @@ async function main(): Promise<void> {
     console.error(
       "usage: node src/mesh/worker.ts [--orchestrator <url>] [--host <host>] [--port <n>] [--model-dir <dir>]\n" +
         "  [--attention exact|landmark|sparse] [--weights fp32|sw2|sw3|sw4] [--kv fp32|sw2|sw3|sw4]\n" +
+        "  [--kv-store host|vram]\n" +
         "  env: SOFTWELL_ORCHESTRATOR_URL, SOFTWELL_WORKER_HOST, SOFTWELL_WORKER_PORT,\n" +
-        "       SOFTWELL_WORKER_MEMORY_BYTES, SOFTWELL_WORKER_DEVICE, SOFTWELL_MODEL_DIR (required)",
+        "       SOFTWELL_WORKER_MEMORY_BYTES, SOFTWELL_WORKER_DEVICE, SOFTWELL_MODEL_DIR (required),\n" +
+        "       SOFTWELL_KV_STORE",
     );
     process.exitCode = 2;
     return;
   }
+
+  // KV store selection (docs/KV-DESIGN.md §5): `host` (default) keeps the
+  // KV cache in worker-local memory; `vram` allocates its pages from
+  // pooled vRAM (replicated, healed on donor loss) via RemoteVramAccess.
+  // There is no runtime fallback: a vram worker whose vRAM is
+  // unreachable fails its stage load loudly and keeps the previous
+  // stage. The selection is logged at startup so a run's store is
+  // visible in the worker log and never inferred.
+  const kvStoreRaw =
+    argValue(argv, "kv-store") ?? process.env.SOFTWELL_KV_STORE ?? "host";
+  if (kvStoreRaw !== "host" && kvStoreRaw !== "vram") {
+    console.error(`[worker] --kv-store must be "host" or "vram", got ${JSON.stringify(kvStoreRaw)}`);
+    process.exitCode = 2;
+    return;
+  }
+  const kvStore: "host" | "vram" = kvStoreRaw;
+  console.log(`[worker] kv-store: ${kvStore}`);
+  const vramAccess: VramAccess | null =
+    kvStore === "vram" ? new RemoteVramAccess(orchestratorUrl) : null;
 
   // Novel engine paths (attention / weight / KV modes); defaults are the
   // baseline. --decoding is a scheduler option and is not read here.
@@ -470,8 +595,14 @@ async function main(): Promise<void> {
 
   // The model loader and the PagedKVCache live with their owners
   // (src/model/loader.ts, src/scheduler/kvcache.ts). The cache factory
-  // below builds one BlockPagedKVCache per stage load (block size 16,
-  // 1024 blocks) from the loaded model's GQA geometry.
+  // below builds one cache per stage load from the loaded model's GQA
+  // geometry: BlockPagedKVCache (block size 16, 1024 blocks) for the
+  // host store, VramPagedKVCache (block size 16, 4096 blocks = 64
+  // 4 MiB chunks) for the vRAM store. The vRAM factory probes the
+  // access (one page alloc + free) so an unreachable vRAM fails the
+  // stage load loudly instead of failing every sequence's first
+  // append; the probe runs inside the factory because the factory is
+  // async-capable (docs/KV-DESIGN.md §6.3).
   let loader: WeightLoader;
   try {
     loader = openWeightLoader(modelDir);
@@ -482,13 +613,37 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const createCache = (manifest: ModelManifest): PagedKVCache =>
-    new BlockPagedKVCache(
+  const createCache = async (
+    manifest: ModelManifest,
+    vram: VramAccess | null,
+  ): Promise<PagedKVCache> => {
+    if (kvStore === "vram") {
+      if (vram === null) {
+        throw new Error(
+          "kv-store vram selected but no VramAccess was provided to the worker (this is a startup bug, not a vRAM outage)",
+        );
+      }
+      // Probe: one page alloc + free. Any failure here rejects the
+      // factory, loadAssignment keeps the previous stage, and the next
+      // poll retries — the P5 behaviour in docs/KV-DESIGN.md.
+      const probe = await vram.alloc(VRAM_PAGE_SIZE_BYTES, { replicas: 2 });
+      await vram.free(probe.id);
+      return new VramPagedKVCache(
+        16,
+        4096,
+        manifest.config.numKeyValueHeads,
+        manifest.config.headDim,
+        vram,
+        { replicas: 2 },
+      );
+    }
+    return new BlockPagedKVCache(
       16,
       1024,
       manifest.config.numKeyValueHeads,
       manifest.config.headDim,
     );
+  };
 
   const backend: EngineBackend = createReferenceBackend();
 
@@ -563,6 +718,7 @@ async function main(): Promise<void> {
     backend,
     loader,
     createCache,
+    vramAccess,
     engineOptions,
     hw,
   });
