@@ -29,8 +29,12 @@ come from the orchestrator's pooled vRAM over the mesh.
 - Activation-side work also landed in this tree (`src/server/registry.ts`
   `getTokenizer` reads the staged vSSD copy; `src/cli.ts`
   `buildFactory` takes the manifest from the registry's staged copy):
-  its dedicated end-to-end proof (re-activation with the model
-  directory moved away) is a follow-up, not yet run.
+  its dedicated end-to-end proof is DONE —
+  `test/reactivation-disk-removed.test.ts` (2026-11-23, 102 s):
+  demo-100m loaded + activated, the model directory renamed away,
+  re-activation succeeds, generation streams the same 8 tokens
+  ("CCCCCCCC") as before the move, zero "using disk weight loader"
+  lines. Activation never reads the model directory from disk.
 
 ## Before the join: blockers that must be cleared first
 

@@ -15,6 +15,7 @@ import type {
   VramWriteResponse,
   WeightMapResponse,
   WorkerCapability,
+  WorkerWeightStats,
 } from "../contracts.ts";
 
 /**
@@ -109,9 +110,192 @@ export interface MeshServerHandlers {
   readVram?: (vaddr: number, length: number) => Promise<Uint8Array>;
   writeVram?: (vaddr: number, data: Uint8Array) => Promise<VramWriteResponse>;
   freeVram?: (id: string) => Promise<VramFreeResponse>;
+  /**
+   * Worker weight-fetch counters (GET /mesh/stats -> WorkerWeightStats).
+   * Supplied by the worker process: the sums of its VramWeightLoaders'
+   * tensorsFetched / bytesFetched (disk loaders contribute 0). Absent
+   * on the orchestrator (which reports its own counter in
+   * ServerStatus.weights instead) — the route then answers 404.
+   */
+  getStats?: () => WorkerWeightStats | Promise<WorkerWeightStats>;
 }
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Binary framing for POST /mesh/execute (activation transport).
+ *
+ * Stage inputs/outputs used to travel as JSON number arrays
+ * (`ExecuteRequest.input.data` / `ExecuteResponse.output.data`) — at
+ * demo-100m geometry (hidden 512) a 16-row prefill chunk is ~8k
+ * floats, ~50–100 KiB of JSON decimal text for 32 KiB of float32.
+ * They now travel as raw float32 LE bytes with a small JSON header:
+ *
+ *   [u32 LE header length][header JSON bytes][float32 LE payload]
+ *
+ * Request header: the ExecuteRequest with `input` reduced to
+ * `{ shape }` (the data rides in the payload). Response header:
+ * `{ isLogits, tokensProcessed, output: { shape } }`. The payload
+ * length must equal prod(shape) * 4 exactly — including 0 for the
+ * scheduler's tokenIds placeholder input `{ data: [], shape: [n, 0] }`.
+ * MeshClient.execute sends binary; the server still accepts JSON
+ * requests (and answers them with JSON) so older clients keep working,
+ * and the client still accepts a JSON response from an older worker.
+ * A binary request always gets a binary response. Malformed frames
+ * (short header, bad JSON, payload length mismatch) are MeshError 400.
+ */
+const EXECUTE_BINARY_HEADER_MAX_BYTES = 1024 * 1024;
+
+function readU32LE(bytes: Uint8Array, offset: number): number {
+  return (
+    (bytes[offset] as number) |
+    ((bytes[offset + 1] as number) << 8) |
+    ((bytes[offset + 2] as number) << 16) |
+    ((bytes[offset + 3] as number) << 24)
+  ) >>> 0;
+}
+
+/** Split a framed body into [header JSON text, payload bytes]. */
+function splitExecuteFrame(bytes: Uint8Array): { headerText: string; payload: Uint8Array } {
+  if (bytes.length < 4) {
+    throw new MeshError("binary execute frame is too short for a header length", { status: 400 });
+  }
+  const headerLen = readU32LE(bytes, 0);
+  if (headerLen > EXECUTE_BINARY_HEADER_MAX_BYTES) {
+    throw new MeshError(
+      `binary execute header length ${headerLen} exceeds ${EXECUTE_BINARY_HEADER_MAX_BYTES}`,
+      { status: 400 },
+    );
+  }
+  if (bytes.length < 4 + headerLen) {
+    throw new MeshError(
+      `binary execute frame is truncated: header claims ${headerLen} bytes, body has ${bytes.length - 4}`,
+      { status: 400 },
+    );
+  }
+  return {
+    headerText: new TextDecoder().decode(bytes.subarray(4, 4 + headerLen)),
+    payload: bytes.subarray(4 + headerLen),
+  };
+}
+
+/** Wrap a header object + float32 payload in the binary frame. */
+function frameExecute(header: unknown, data: number[] | Float32Array): Uint8Array {
+  const headerBytes = new TextEncoder().encode(JSON.stringify(header));
+  const f32 = data instanceof Float32Array ? data : Float32Array.from(data);
+  const out = new Uint8Array(4 + headerBytes.length + f32.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, headerBytes.length, true);
+  out.set(headerBytes, 4);
+  out.set(new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength), 4 + headerBytes.length);
+  return out;
+}
+
+function parseShape(shape: unknown, what: string): number[] {
+  if (
+    !Array.isArray(shape) ||
+    shape.length === 0 ||
+    shape.some((d) => !Number.isInteger(d) || (d as number) < 0)
+  ) {
+    throw new MeshError(`binary execute ${what}: shape must be a non-empty array of non-negative integers`, { status: 400 });
+  }
+  return shape as number[];
+}
+
+/** Decode a binary POST /mesh/execute request body to an ExecuteRequest. */
+export function decodeExecuteRequest(bytes: Uint8Array): ExecuteRequest {
+  const { headerText, payload } = splitExecuteFrame(bytes);
+  let header: unknown;
+  try {
+    header = JSON.parse(headerText) as unknown;
+  } catch (err) {
+    throw new MeshError("binary execute header is not valid JSON", {
+      status: 400,
+      code: "INVALID_JSON",
+      cause: err,
+    });
+  }
+  if (typeof header !== "object" || header === null) {
+    throw new MeshError("binary execute header must be a JSON object", { status: 400 });
+  }
+  const h = header as Record<string, unknown>;
+  const input = h["input"];
+  if (typeof input !== "object" || input === null) {
+    throw new MeshError("binary execute header must carry input.shape", { status: 400 });
+  }
+  const shape = parseShape((input as Record<string, unknown>)["shape"], "request");
+  const expected = shape.reduce((a, b) => a * b, 1) * 4;
+  if (payload.length !== expected) {
+    throw new MeshError(
+      `binary execute payload is ${payload.length} bytes but shape [${shape.join(", ")}] needs ${expected}`,
+      { status: 400 },
+    );
+  }
+  // Float32Array needs a 4-byte-aligned offset; copy when misaligned.
+  const aligned = payload.byteOffset % 4 === 0 ? payload : Uint8Array.from(payload);
+  const f32 = new Float32Array(aligned.buffer, aligned.byteOffset, aligned.length / 4);
+  return { ...(h as unknown as ExecuteRequest), input: { data: Array.from(f32), shape } };
+}
+
+/** Encode an ExecuteRequest as a binary POST /mesh/execute body. */
+export function encodeExecuteRequest(req: ExecuteRequest): Uint8Array {
+  const { data: _data, ...inputRest } = req.input;
+  void _data;
+  return frameExecute(
+    { ...req, input: { ...inputRest, shape: req.input.shape } },
+    req.input.data,
+  );
+}
+
+/** Decode a binary POST /mesh/execute response body to an ExecuteResponse. */
+export function decodeExecuteResponse(bytes: Uint8Array): ExecuteResponse {
+  const { headerText, payload } = splitExecuteFrame(bytes);
+  let header: unknown;
+  try {
+    header = JSON.parse(headerText) as unknown;
+  } catch (err) {
+    throw new MeshError("binary execute response header is not valid JSON", {
+      status: 400,
+      code: "INVALID_JSON",
+      cause: err,
+    });
+  }
+  if (typeof header !== "object" || header === null) {
+    throw new MeshError("binary execute response header must be a JSON object", { status: 400 });
+  }
+  const h = header as Record<string, unknown>;
+  const output = h["output"];
+  if (typeof output !== "object" || output === null) {
+    throw new MeshError("binary execute response header must carry output.shape", { status: 400 });
+  }
+  const shape = parseShape((output as Record<string, unknown>)["shape"], "response");
+  const expected = shape.reduce((a, b) => a * b, 1) * 4;
+  if (payload.length !== expected) {
+    throw new MeshError(
+      `binary execute response payload is ${payload.length} bytes but shape [${shape.join(", ")}] needs ${expected}`,
+      { status: 400 },
+    );
+  }
+  const aligned = payload.byteOffset % 4 === 0 ? payload : Uint8Array.from(payload);
+  const f32 = new Float32Array(aligned.buffer, aligned.byteOffset, aligned.length / 4);
+  return {
+    output: { data: Array.from(f32), shape },
+    isLogits: h["isLogits"] === true,
+    tokensProcessed: typeof h["tokensProcessed"] === "number" ? h["tokensProcessed"] : 0,
+  };
+}
+
+/** Encode an ExecuteResponse as a binary response body. */
+export function encodeExecuteResponse(res: ExecuteResponse): Uint8Array {
+  return frameExecute(
+    {
+      isLogits: res.isLogits,
+      tokensProcessed: res.tokensProcessed,
+      output: { shape: res.output.shape },
+    },
+    res.output.data,
+  );
+}
 
 /** Largest single KV read/write (16 vRAM pages — a chunk is one page). */
 export const MAX_KV_RANGE_BYTES = 64 * 1024 * 1024;
@@ -222,6 +406,7 @@ function normalizePath(pathname: string): string {
  *   GET  /mesh/vram/read?vaddr=...&length=... (byte range, octet-stream)
  *   POST /mesh/vram/write?vaddr=...         (octet-stream body -> {bytesWritten})
  *   POST /mesh/vram/free                    (JSON {id} -> {freed})
+ *   GET  /mesh/stats                        (worker weight-fetch counters, JSON)
  * The caller owns listen()/close(). Unknown routes answer 404, a known
  * route with the wrong method answers 405, a route whose handler was not
  * supplied answers 404.
@@ -262,6 +447,7 @@ async function handleRequest(
     "/mesh/vram/read",
     "/mesh/vram/write",
     "/mesh/vram/free",
+    "/mesh/stats",
   ];
   if (!knownPaths.includes(path)) {
     sendJson(res, 404, { error: `unknown route: ${method} ${path}` });
@@ -287,6 +473,12 @@ async function handleRequest(
       (!Number.isInteger(body.replicas) || (body.replicas as number) < 1)
     ) {
       return sendJson(res, 400, { error: "body.replicas must be a positive integer when given" });
+    }
+    if (
+      body.owner !== undefined &&
+      (typeof body.owner !== "string" || body.owner === "")
+    ) {
+      return sendJson(res, 400, { error: "body.owner must be a non-empty string when given" });
     }
     sendJson(res, 200, await handlers.allocVram(body as VramAllocRequest));
     return;
@@ -397,6 +589,16 @@ async function handleRequest(
     return;
   }
 
+  // path === "/mesh/stats"
+  if (path === "/mesh/stats") {
+    if (method !== "GET") return sendJson(res, 405, { error: "method not allowed" });
+    if (handlers.getStats === undefined) {
+      return sendJson(res, 404, { error: "stats not available on this server" });
+    }
+    sendJson(res, 200, await handlers.getStats());
+    return;
+  }
+
   // path === "/mesh/free-sequence"
   if (path === "/mesh/free-sequence") {
     if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
@@ -415,6 +617,23 @@ async function handleRequest(
   if (method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
   if (handlers.execute === undefined) {
     return sendJson(res, 404, { error: "execute not available on this server" });
+  }
+  // Binary (application/octet-stream) is the current transport
+  // (MeshClient.execute): a framed header + float32 payload, answered
+  // with the same framing. JSON is still accepted — and answered with
+  // JSON — so older clients keep working.
+  const contentType = (req.headers["content-type"] ?? "").split(";")[0].trim();
+  if (contentType === "application/octet-stream") {
+    const raw = await readRawBody(req, MAX_BODY_BYTES);
+    const parsed = decodeExecuteRequest(raw);
+    const resp = await handlers.execute(parsed);
+    const bytes = encodeExecuteResponse(resp);
+    res.writeHead(200, {
+      "content-type": "application/octet-stream",
+      "content-length": bytes.byteLength,
+    });
+    res.end(bytes);
+    return;
   }
   const body = (await readJsonBody(req)) as ExecuteRequest;
   sendJson(res, 200, await handlers.execute(body));
@@ -607,9 +826,13 @@ export class MeshClient {
   async allocVram(
     orchestratorUrl: string,
     sizeBytes: number,
-    opts?: { replicas?: number },
+    opts?: { replicas?: number; owner?: string },
   ): Promise<VramAllocResponse> {
-    const body: VramAllocRequest = { sizeBytes, ...(opts?.replicas !== undefined ? { replicas: opts.replicas } : {}) };
+    const body: VramAllocRequest = {
+      sizeBytes,
+      ...(opts?.replicas !== undefined ? { replicas: opts.replicas } : {}),
+      ...(opts?.owner !== undefined ? { owner: opts.owner } : {}),
+    };
     return this.request<VramAllocResponse>(joinUrl(orchestratorUrl, "/mesh/vram/alloc"), {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -664,12 +887,27 @@ export class MeshClient {
     });
   }
 
+  /**
+   * Execute one pipeline stage on a worker (POST /mesh/execute).
+   * Binary transport: the request goes as a framed header + float32
+   * payload (application/octet-stream) and the response comes back
+   * the same way. A worker that answers JSON instead (an older
+   * worker) is still accepted — the response content-type decides.
+   */
   async execute(workerUrl: string, req: ExecuteRequest): Promise<ExecuteResponse> {
-    return this.request<ExecuteResponse>(joinUrl(workerUrl, "/mesh/execute"), {
+    const url = joinUrl(workerUrl, "/mesh/execute");
+    const res = await this.fetchRaw(url, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(req),
+      headers: { "content-type": "application/octet-stream" },
+      body: encodeExecuteRequest(req),
     });
+    if (!res.ok) throw await this.errorFromResponse(res, url);
+    const contentType = (res.headers.get("content-type") ?? "").split(";")[0].trim();
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (contentType === "application/octet-stream") {
+      return decodeExecuteResponse(bytes);
+    }
+    return JSON.parse(new TextDecoder().decode(bytes)) as ExecuteResponse;
   }
 
   /**
@@ -682,6 +920,17 @@ export class MeshClient {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ seqId }),
+    });
+  }
+
+  /**
+   * Worker weight-fetch counters (GET /mesh/stats): the sums of that
+   * worker's VramWeightLoaders' tensorsFetched / bytesFetched.
+   * 404 on a server without the handler (e.g. the orchestrator).
+   */
+  async getStats(workerUrl: string): Promise<WorkerWeightStats> {
+    return this.request<WorkerWeightStats>(joinUrl(workerUrl, "/mesh/stats"), {
+      method: "GET",
     });
   }
 }

@@ -6,10 +6,11 @@
  * interfaces, the scheduler interface, and the public API shapes.
  *
  * Transport note: the reference implementation speaks plain HTTP + JSON
- * (Node built-ins only). Hidden states travel as JSON number arrays. That is
- * fine at demo scale (hidden size in the hundreds) and deliberately simple;
- * a production deployment would swap the transport for binary/gRPC without
- * changing these shapes.
+ * (Node built-ins only). Hidden states cross POST /mesh/execute as
+ * binary float32 with a small JSON header (see the binary framing in
+ * src/mesh/protocol.ts) — the JSON number-array form is still accepted
+ * for backward compatibility. A production deployment would swap the
+ * transport for binary/gRPC without changing these shapes.
  *
  * Runtime note: code runs under Node >= 22 with type stripping, so this file
  * (and all code in the repo) must use erasable TypeScript only: no enums,
@@ -152,6 +153,14 @@ export interface WeightMapResponse {
 export interface VramAllocRequest {
   sizeBytes: number;
   replicas?: number;
+  /**
+   * Owner of the allocation (a worker id), for the orphaned-chunk
+   * reaper (docs/KV-DESIGN.md §7b): when the registry declares that
+   * worker dead, the orchestrator frees every allocation tagged with
+   * it. Untagged allocations (older clients) are never reaped by
+   * owner. The tag is advisory bookkeeping, not access control.
+   */
+  owner?: string;
 }
 
 /** POST /mesh/vram/alloc response: the allocation the worker holds. */
@@ -654,13 +663,24 @@ export interface VramAccess {
    * Allocate `sizeBytes` (rounded up to whole vRAM pages by the
    * implementation) and return its id and base virtual address.
    * `opts.replicas` overrides the implementation default when given.
+   * `opts.owner` tags the allocation for the orphaned-chunk reaper
+   * (see VramAllocRequest.owner); implementations that do not cross
+   * the mesh may ignore it.
    */
   alloc(
     sizeBytes: number,
-    opts?: { replicas?: number },
+    opts?: { replicas?: number; owner?: string },
   ): Promise<{ id: string; vaddr: number }>;
   /** Release an allocation created by alloc(). */
   free(id: string): Promise<void>;
+  /**
+   * Tag future allocs with an owner (a worker id) for the
+   * orphaned-chunk reaper. Optional: in-process accesses have no
+   * orchestrator to tag for and ignore it. The worker sets this to
+   * its own id once registered, so every KV chunk it allocates
+   * afterwards carries its id.
+   */
+  setOwner?(owner: string): void;
 }
 
 // --- vGPU: one virtual GPU dispatching across real devices -----------------
@@ -1296,6 +1316,28 @@ export interface ServerStatus {
   vm: VirtualMachineInfo | null;
   /** Last few request records (newest first). */
   recentRequests: ServerRequestRecord[];
+  /**
+   * Weight-serving counters (GET /v1/server/status): raw weight bytes
+   * the orchestrator has served to workers from pooled vRAM
+   * (ModelRegistry.weightBytesServed). Absent on minimal ServingResolver
+   * fakes that do not carry a registry; the real server always sets it.
+   * Per-worker fetch counts (VramWeightLoader.tensorsFetched /
+   * bytesFetched) live on the workers themselves: GET /mesh/stats on a
+   * worker (see WorkerWeightStats).
+   */
+  weights?: { bytesServed: number };
+}
+
+/**
+ * Per-worker weight-fetch counters (GET /mesh/stats on a worker):
+ * distinct tensors / raw bytes that worker's VramWeightLoaders have
+ * actually fetched from pooled vRAM (cache hits excluded). Disk
+ * loaders contribute 0. The orchestrator-side total is
+ * ServerStatus.weights.bytesServed.
+ */
+export interface WorkerWeightStats {
+  tensorsFetched: number;
+  bytesFetched: number;
 }
 
 export interface HealthStatus {

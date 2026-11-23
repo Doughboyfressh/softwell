@@ -286,6 +286,21 @@ async function main(): Promise<void> {
     assert.equal(execResp.isLogits, false);
     assert.equal(execResp.tokensProcessed, 2);
 
+    // GET /mesh/stats: the worker's weight-fetch counters. This worker
+    // only ever built the fake (disk) loader, so both counters are 0 —
+    // the route and the shape are what this pins; the >0 case is
+    // covered by test/vram-weights.test.ts, where a real
+    // VramWeightLoader fetches tensors.
+    assert.deepEqual(await client.getStats(workerUrl), {
+      tensorsFetched: 0,
+      bytesFetched: 0,
+    });
+    // The orchestrator server has no stats handler: 404.
+    await assert.rejects(
+      client.getStats(orchUrl),
+      (err: unknown) => err instanceof MeshError && err.status === 404,
+    );
+
     // POST /mesh/free-sequence releases the sequence's KV on the worker
     // (the scheduler's freeSequence path — without it the cache leaked
     // every finished sequence until the stage reloaded, 2026-11-23).

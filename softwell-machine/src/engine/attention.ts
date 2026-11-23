@@ -119,6 +119,70 @@ export function rope(positions: number[], headDim: number, theta: number): RopeT
 }
 
 /**
+ * Lazily built RoPE cos/sin tables, one cache per (theta, headDim).
+ * applyRope used to recompute Math.pow/cos/sin for every frequency on
+ * every row of every layer (26 µs/row/layer; 6.7x slower than a table
+ * lookup, measured in scripts/profile-forward.ts). Positions are cached
+ * on first use and the tables grow by doubling; positions past
+ * ROPE_CACHE_MAX_POS are computed on the fly so an unbounded context
+ * cannot grow the cache without bound.
+ */
+const ROPE_CACHE_MAX_POS = 1 << 20;
+interface RopeCacheEntry {
+  /** cos/sin, [capacity, half] flattened row-major, valid for pos < filled. */
+  cos: Float32Array;
+  sin: Float32Array;
+  /** Number of positions computed so far. */
+  filled: number;
+}
+const ropeCache = new Map<string, RopeCacheEntry>();
+function ropeRow(theta: number, headDim: number, pos: number): { cos: Float32Array; sin: Float32Array } {
+  const half = headDim / 2;
+  if (pos >= ROPE_CACHE_MAX_POS) {
+    const cos = new Float32Array(half);
+    const sin = new Float32Array(half);
+    for (let i = 0; i < half; i++) {
+      const angle = pos * Math.pow(theta, -2 * i / headDim);
+      cos[i] = Math.cos(angle);
+      sin[i] = Math.sin(angle);
+    }
+    return { cos, sin };
+  }
+  const key = `${theta}:${headDim}`;
+  let entry = ropeCache.get(key);
+  if (entry === undefined) {
+    const capacity = 64;
+    entry = { cos: new Float32Array(capacity * half), sin: new Float32Array(capacity * half), filled: 0 };
+    ropeCache.set(key, entry);
+  }
+  if (pos >= entry.filled) {
+    // Grow (doubling) so the requested position fits, then fill in order.
+    let capacity = entry.cos.length / half;
+    while (pos >= capacity) capacity *= 2;
+    if (capacity * half > entry.cos.length) {
+      const cos = new Float32Array(capacity * half);
+      const sin = new Float32Array(capacity * half);
+      cos.set(entry.cos.subarray(0, entry.filled * half));
+      sin.set(entry.sin.subarray(0, entry.filled * half));
+      entry.cos = cos;
+      entry.sin = sin;
+    }
+    for (let p = entry.filled; p <= pos; p++) {
+      for (let i = 0; i < half; i++) {
+        const angle = p * Math.pow(theta, -2 * i / headDim);
+        entry.cos[p * half + i] = Math.cos(angle);
+        entry.sin[p * half + i] = Math.sin(angle);
+      }
+    }
+    entry.filled = pos + 1;
+  }
+  return {
+    cos: entry.cos.subarray(pos * half, (pos + 1) * half),
+    sin: entry.sin.subarray(pos * half, (pos + 1) * half),
+  };
+}
+
+/**
  * Apply RoPE in place to q and k.
  *
  * q is [rows, numHeads, headDim] and k is [rows, numKvHeads, headDim]
@@ -126,6 +190,11 @@ export function rope(positions: number[], headDim: number, theta: number): RopeT
  * row. numKvHeads may be < numHeads (GQA). Rotation uses interleaved pairs
  * (x0, x1) -> (x0*cos - x1*sin, x0*sin + x1*cos), the HF Llama convention.
  * Rotating by position 0 is the identity.
+ *
+ * cos/sin come from a lazily built per-position cache (see ropeRow):
+ * identical values to computing them per element (max abs diff 6e-8
+ * at Float32 rounding, measured in scripts/profile-forward.ts), ~6.7x
+ * faster per row.
  */
 export function applyRope(
   q: Float32Array,
@@ -151,13 +220,12 @@ export function applyRope(
   const rotate = (x: Float32Array, rowSize: number, heads: number): void => {
     for (let r = 0; r < rows; r++) {
       const pos = positions[r];
+      const { cos, sin } = ropeRow(theta, headDim, pos);
       for (let h = 0; h < heads; h++) {
         const base = r * rowSize + h * headDim;
         for (let i = 0; i < half; i++) {
-          const freq = Math.pow(theta, -2 * i / headDim);
-          const angle = pos * freq;
-          const c = Math.cos(angle);
-          const s = Math.sin(angle);
+          const c = cos[i];
+          const s = sin[i];
           const i0 = base + 2 * i;
           const i1 = i0 + 1;
           const x0 = x[i0];
@@ -233,12 +301,17 @@ export function groupedQueryAttention(
   const scale = options.scale ?? 1 / Math.sqrt(headDim);
   const causal = options.causal ?? true;
   const out = new Float32Array(numHeads * headDim);
+  // One scores array, reused across heads and softmaxed in place (no
+  // second weights array). The Q.K dot is unrolled by 4 with independent
+  // accumulators, as in matmulTransposeB: measured 1.10-1.19x vs the
+  // serial-dot version at kvLen 21-997 (scripts/profile-forward-3.ts),
+  // bit-identical at these magnitudes.
+  const scores = new Float32Array(kvLen);
 
   for (let h = 0; h < numHeads; h++) {
     const kvHead = Math.floor(h / groupSize);
     const qOff = h * headDim;
     // Scores over KV positions.
-    const scores = new Float32Array(kvLen);
     let max = -Infinity;
     for (let t = 0; t < kvLen; t++) {
       if (causal && options.kvPositions && options.queryPosition !== undefined) {
@@ -248,24 +321,33 @@ export function groupedQueryAttention(
         }
       }
       const kOff = (t * numKvHeads + kvHead) * headDim;
-      let dot = 0;
-      for (let d = 0; d < headDim; d++) dot += q[qOff + d] * k[kOff + d];
+      let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+      let d = 0;
+      const lim = headDim - (headDim % 4);
+      for (; d < lim; d += 4) {
+        s0 += q[qOff + d] * k[kOff + d];
+        s1 += q[qOff + d + 1] * k[kOff + d + 1];
+        s2 += q[qOff + d + 2] * k[kOff + d + 2];
+        s3 += q[qOff + d + 3] * k[kOff + d + 3];
+      }
+      let dot = (s0 + s1) + (s2 + s3);
+      for (; d < headDim; d++) dot += q[qOff + d] * k[kOff + d];
       scores[t] = dot * scale;
       if (scores[t] > max) max = scores[t];
     }
-    // Stable softmax + weighted sum of V.
+    if (max === -Infinity) continue; // fully masked: leave zeros
+    // Stable softmax in place, then weighted sum of V.
     let sum = 0;
-    const weights = new Float32Array(kvLen);
     for (let t = 0; t < kvLen; t++) {
-      weights[t] = scores[t] === -Infinity ? 0 : Math.exp(scores[t] - max);
-      sum += weights[t];
+      scores[t] = scores[t] === -Infinity ? 0 : Math.exp(scores[t] - max);
+      sum += scores[t];
     }
     const oOff = h * headDim;
-    if (sum === 0) continue; // fully masked: leave zeros
+    if (sum === 0) continue;
     const inv = 1 / sum;
     for (let t = 0; t < kvLen; t++) {
-      if (weights[t] === 0) continue;
-      const w = weights[t] * inv;
+      const w = scores[t] * inv;
+      if (w === 0) continue;
       const vOff = (t * numKvHeads + kvHead) * headDim;
       for (let d = 0; d < headDim; d++) out[oOff + d] += w * v[vOff + d];
     }
@@ -281,7 +363,20 @@ export function silu(x: number): number {
 /**
  * SwiGLU MLP for a single row: down(silu(x @ gateW^T) * (x @ upW^T)).
  * gateW/upW are [intermediateSize, hiddenSize], downW is [hiddenSize, intermediateSize].
+ *
+ * Fused and tiled: for each tile of SWIGLU_TILE intermediate units, the
+ * gate and up dots for that unit share one pass over x (x is loaded once
+ * for both, instead of once per matmul), the silu*up product goes into a
+ * small tile buffer, and the down projection for the tile is accumulated
+ * straight into the output. The full gate/up/hidden arrays are never
+ * materialized. Measured on this host (SmolLM-135M shapes, interleaved
+ * medians, scripts/profile-forward-3.ts): 1.23-1.25x vs the three-matmul
+ * version. The down accumulation is re-associated across tiles, so
+ * outputs differ from the unfused version by ~8e-6 absolute at these
+ * magnitudes (verified in test/forward-opt.test.ts); token identity is
+ * checked end-to-end by scripts/bench-forward-opt.ts.
  */
+const SWIGLU_TILE = 256;
 export function swiglu(
   x: Float32Array,
   gateW: Float32Array,
@@ -296,11 +391,55 @@ export function swiglu(
   if (upW.length !== gateW.length || downW.length !== hiddenSize * intermediateSize) {
     throw new Error("swiglu: weight shape mismatch");
   }
-  const gate = matmulTransposeB(x, 1, hiddenSize, gateW, intermediateSize, hiddenSize);
-  const up = matmulTransposeB(x, 1, hiddenSize, upW, intermediateSize, hiddenSize);
-  const hidden = new Float32Array(intermediateSize);
-  for (let i = 0; i < intermediateSize; i++) hidden[i] = silu(gate[i]) * up[i];
-  return matmulTransposeB(hidden, 1, intermediateSize, downW, hiddenSize, intermediateSize);
+  const out = new Float32Array(hiddenSize);
+  const hidden = new Float32Array(SWIGLU_TILE);
+  for (let j0 = 0; j0 < intermediateSize; j0 += SWIGLU_TILE) {
+    const jt = Math.min(SWIGLU_TILE, intermediateSize - j0);
+    for (let j = 0; j < jt; j++) {
+      const gj = j0 + j;
+      const gRow = gj * hiddenSize;
+      const uRow = gj * hiddenSize;
+      let g0 = 0, g1 = 0, g2 = 0, g3 = 0;
+      let u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+      let k = 0;
+      const lim = hiddenSize - (hiddenSize % 4);
+      for (; k < lim; k += 4) {
+        const x0 = x[k], x1 = x[k + 1], x2 = x[k + 2], x3 = x[k + 3];
+        g0 += x0 * gateW[gRow + k];
+        g1 += x1 * gateW[gRow + k + 1];
+        g2 += x2 * gateW[gRow + k + 2];
+        g3 += x3 * gateW[gRow + k + 3];
+        u0 += x0 * upW[uRow + k];
+        u1 += x1 * upW[uRow + k + 1];
+        u2 += x2 * upW[uRow + k + 2];
+        u3 += x3 * upW[uRow + k + 3];
+      }
+      let g = (g0 + g1) + (g2 + g3);
+      let u = (u0 + u1) + (u2 + u3);
+      for (; k < hiddenSize; k++) {
+        g += x[k] * gateW[gRow + k];
+        u += x[k] * upW[uRow + k];
+      }
+      hidden[j] = silu(g) * u;
+    }
+    // Down projection for this tile, accumulated into out.
+    for (let i = 0; i < hiddenSize; i++) {
+      const dRow = i * intermediateSize + j0;
+      let s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+      let k = 0;
+      const lim = jt - (jt % 4);
+      for (; k < lim; k += 4) {
+        s0 += hidden[k] * downW[dRow + k];
+        s1 += hidden[k + 1] * downW[dRow + k + 1];
+        s2 += hidden[k + 2] * downW[dRow + k + 2];
+        s3 += hidden[k + 3] * downW[dRow + k + 3];
+      }
+      let s = (s0 + s1) + (s2 + s3);
+      for (; k < jt; k++) s += hidden[k] * downW[dRow + k];
+      out[i] += s;
+    }
+  }
+  return out;
 }
 
 export interface MoeExpertWeights {

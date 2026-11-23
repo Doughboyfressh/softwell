@@ -48,6 +48,8 @@ export class RemoteVramAccess implements VramAccess {
   allocs = 0;
   /** Frees issued through this client. */
   frees = 0;
+  /** Owner tag for future allocs (set by the worker once registered). */
+  private owner: string | undefined;
 
   private readonly orchestratorUrl: string;
   private readonly client: MeshClient;
@@ -100,9 +102,24 @@ export class RemoteVramAccess implements VramAccess {
     this.bytesWritten += data.length;
   }
 
+  /**
+   * Tag future allocs with an owner (the worker's id) for the
+   * orphaned-chunk reaper (docs/KV-DESIGN.md §7b). The worker calls
+   * this once it knows its id (after registration); allocs made
+   * before that (none on the serving path — the probe alloc runs at
+   * stage load, after registration) stay untagged and are never
+   * reaped by owner.
+   */
+  setOwner(owner: string): void {
+    if (typeof owner !== "string" || owner === "") {
+      throw new Error("RemoteVramAccess.setOwner: owner must be a non-empty string");
+    }
+    this.owner = owner;
+  }
+
   async alloc(
     sizeBytes: number,
-    opts?: { replicas?: number },
+    opts?: { replicas?: number; owner?: string },
   ): Promise<{ id: string; vaddr: number }> {
     if (!Number.isInteger(sizeBytes) || sizeBytes <= 0) {
       throw new Error(`RemoteVramAccess.alloc: sizeBytes must be a positive integer, got ${sizeBytes}`);
@@ -115,7 +132,14 @@ export class RemoteVramAccess implements VramAccess {
         `RemoteVramAccess.alloc: replicas must be a positive integer when given, got ${opts.replicas}`,
       );
     }
-    const alloc = await this.client.allocVram(this.orchestratorUrl, sizeBytes, opts);
+    const alloc = await this.client.allocVram(this.orchestratorUrl, sizeBytes, {
+      ...(opts?.replicas !== undefined ? { replicas: opts.replicas } : {}),
+      ...(opts?.owner !== undefined
+        ? { owner: opts.owner }
+        : this.owner !== undefined
+          ? { owner: this.owner }
+          : {}),
+    });
     this.allocs += 1;
     return { id: alloc.id, vaddr: alloc.vaddr };
   }

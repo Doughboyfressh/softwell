@@ -11,7 +11,9 @@ leaves the FP32 path byte-identical), tested in
 The instruction set (§1), memory model (§2, D1 confirmed as built),
 streams (§3.1), and hypervisor registration (§3.1) exist and are
 tested (`test/vnpu-kernels.test.ts`, `test/vnpu-sram.test.ts`,
-`test/vnpu-hypervisor.test.ts`). What is NOT built yet: the
+`test/vnpu-hypervisor.test.ts`). The dequantization cache
+landed 2026-11-23 (`src/hw/vnpu.ts`, `test/vnpu-dequant-cache.test.ts`,
+§5.3 "After the dequantization cache"). What is NOT built yet: the
 donor-side `VnpuNode` (§4.2).
 
 **What the vNPU is.** A fifth virtual device alongside vGPU, vCPU,
@@ -652,7 +654,7 @@ over INT8 at large squares (512^3: the FP32 kernel's MAC speed
 finally outweighs the dequantize cost). Neither wins over FP32
 anywhere here.
 
-#### Why the quantized path is slow — the measured bottleneck
+#### Why the quantized path is slow — the measured bottleneck (fixed 2026-11-23 by the dequantization cache, see below)
 
 The per-call cost is not the MACs. Every `matmulTransposeB`
 with a staged weight re-derives the dequantized weight and the
@@ -667,13 +669,161 @@ an O(1-row) matmul. Measured per m=1 call: ~9 ms (INT8),
 accounts for the observed decode rates (INT8 0.56 tok/s,
 FP8 0.13 tok/s) and for FP8 being ~4× slower than INT8 at
 prefill/decode despite running the faster FP32 kernel for the
-MACs. The fix is a follow-up for the core-device workstream,
-not this one: cache the dequantized values + `QuantAnalysis`
+MACs. The fix was a follow-up for the core-device workstream:
+cache the dequantized values + `QuantAnalysis`
 per staged weight key (they are pure functions of the staged
 payload, which is immutable between stages), so a call pays
-only the MACs plus activation quantization. Until then, the
-vNPU's INT8/FP8 win is bytes moved, not wall-clock time —
-same as SW-code.
+only the MACs plus activation quantization.
+
+**Fixed 2026-11-23 — the dequantization cache
+(`src/hw/vnpu.ts`, `test/vnpu-dequant-cache.test.ts`).** The
+device now retains the dequantized FP32 values +
+`QuantAnalysis` per staged weight key, populated at stage
+time from the quantize call `stageWeights` already makes
+(zero extra compute at stage). The cache is coordinator-side
+host RAM, not modeled SRAM: accounted separately
+(`VirtualNpu.dequantCacheStatus()`), capped at 1 GiB LRU
+(`VNPU_DEQUANT_CACHE_BYTES`, override with
+`VirtualNpuOpts.dequantCacheBytes`, 0 disables it), and
+invalidated by exactly the events that drop the resident
+copy — re-stage under the same key, SRAM eviction, explicit
+`evictWeights`, donor loss. A weight whose dequantization
+alone exceeds the cap is never cached; a miss re-derives
+(the old code path, kept verbatim) and re-attaches if the
+cap allows. Measured after-results are in the next
+subsection; the headline is that the per-call O(weight)
+pass is gone — FP8 decode went 0.13 → 3.49 tok/s and now
+runs at 0.87× the FP32 rate in the same run, INT8 decode
+0.56 → 2.5 tok/s (0.62× FP32). Neither beats FP32 on this
+CPU backend, as expected: the cache removes the
+re-derivation tax, it does not make the MACs faster.
+
+#### After the dequantization cache — measured 2026-11-23
+
+Run: `node scripts/bench-vnpu.ts` (same script, same
+protocol as the §5.3 baseline above), 15:05–15:14 UTC
+2026-11-23. Machine: same AMD EPYC 9D25, 4 cores visible,
+7.7 GiB RAM, Node v24.22.1 — but a busier host than the
+baseline run: two other workstreams running concurrently,
+loadavg 1.3–2.9 through the run (baseline: 1.0–1.7), and
+the FP32 control shows it (generate 4.29 → 3.35 tok/s,
+decode-only 5.87 → 4.01 tok/s, prefill 5.678 → 3.094
+tok/s). Read the before/after ratios against the FP32
+control in the same run, not just the raw tok/s: the
+within-run ratios are the load-robust comparison. Raw
+JSONs: `vnpu-perplexity-bench-after-dequant-cache.json`,
+`vnpu-tok-bench-after-dequant-cache.json`,
+`vnpu-kernel-bench-after-dequant-cache.json` (the baseline
+`vnpu-*.json` files are untouched).
+
+tok/s, short prompt, 16 tokens, temp 0, 1 rep (tokens
+identical to baseline in all three modes):
+
+| mode | median generate tok/s | vs baseline | vs FP32 this run | decode-only tok/s | vs baseline | prefill ms |
+|---|---|---|---|---|---|---|
+| FP32 (baseline) | 3.35 | 4.29 → 3.35 (host load) | — | 4.01 | 5.87 → 4.01 | 1,491 |
+| INT8 (vNPU) | 1.97 | 0.45 → 1.97 (4.4×) | 0.59× | 2.50 | 0.56 → 2.50 (4.5×) | 2,211 |
+| FP8 (vNPU) | 2.81 | 0.11 → 2.81 (25×) | 0.84× | 3.49 | 0.13 → 3.49 (27×) | 1,388 |
+
+Perplexity bench (252 tokens): INT8 prefill 0.813 →
+1.40 tok/s, decode 0.546 → 2.43 tok/s; FP8 prefill 0.194 →
+3.108 tok/s (16×, 1.00× the FP32 prefill rate this run),
+decode 0.129 → 3.094 tok/s (24×). Model-load seconds
+rose (INT8 6.6 → 16.2 s ppl / 7.5 → 8.5 s tok; FP8 24.5 →
+36.7 s ppl / 23.4 → 33.4 s tok): staging does the same
+quantize work as before — the cache adds zero compute at
+stage time — so this is the loaded host (and, in the ppl
+bench, each mode loading after the previous mode's
+executor in the same process), not the cache.
+
+Kernel throughput, staged weights, 2 timed reps, median
+(FP32 column this run is noisy — q/o 0.53 ms vs 2.93 ms
+baseline, gate/up 17.96 ms vs 1.61 ms — 2 reps on a loaded
+host; the INT8/FP8 absolutes are the signal, and every
+result is still within its computed error bound):
+
+| shape | FP32 ms (this run) | INT8 ms (baseline → now) | FP8 ms (baseline → now) |
+|---|---|---|---|
+| q/o [1,576]x[576,576] | 0.53 | 10.18 → 0.73 | 16.88 → 0.56 |
+| gate/up [1,576]x[1536,576] | 17.96 | 12.99 → 2.20 | 41.49 → 1.23 |
+| down [1,1536]x[576,1536] | 1.08 | 23.18 → 2.07 | 42.44 → 1.33 |
+| lm_head [1,576]x[49152,576] | 51.63 | 506.94 → 93.64 | 1,353.86 → 57.56 |
+| prefill gate [5,576]x[1536,576] | 21.11 | 19.64 → 10.72 | 44.84 → 6.11 |
+| square 256^3 | 35.17 | 38.62 → 80.00 | 34.06 → 31.76 |
+| square 512^3 | 249.26 | 287.86 → 457.42 | 235.09 → 298.37 |
+
+The m=1 decode shapes improve 5–24× — that is where the
+cache lives, since the dequantized weight dwarfs the MACs
+there. The square shapes do not improve: at 512^3 the
+weight is only 262k elements, so dequantization was never
+the bottleneck — the MACs are — and their slower absolutes
+track the host load (FP32 squares are 1.5–1.7× slower this
+run too). FP8 lm_head at 57.56 ms vs FP32 51.63 ms is the
+closest the vNPU path gets to FP32 parity on any shape;
+INT8 lm_head at 93.64 ms is the naive integer core, not
+the cache (follow-up below).
+
+Cache footprint, measured: the full SmolLM-135M model
+retains **542,179,584 bytes (517.1 MiB) across 211 staged
+weights, 0 evictions** — the 1 GiB cap holds it with ~2×
+headroom (`dequantCacheStatus()` from the A/B run below).
+Bench-process RSS (10 s samples): FP32-only ~780 MiB
+steady; INT8/FP8 steady ~1.35–1.40 GiB (FP32 weights +
+staged codes + the 517 MiB cache); transient peak during
+FP8 staging ~1.85–1.96 GiB (the quantize call's transient
+`scaled` + `values` + `err` arrays coexisting with the
+growing cache). On the 7.7 GiB host that fits; the cap is
+what bounds it for larger models.
+
+Perplexity — read with the confound noted here: the
+after-run reads INT8 64.106 (baseline 61.610) and FP8
+51.118 (baseline 50.092), FP32 47.539 unchanged. Those
+quantized deltas are NOT the cache: a same-tree A/B
+(cache on vs `dequantCacheBytes: 0`, chunk 0, same
+process) gives **0 / 3,145,728 logits differing,
+maxAbsDiff 0, identical mean NLL** for both INT8 (3.44210)
+and FP8 (3.40786) — the cache is bit-identical to
+re-derivation by construction, and the A/B proves it.
+The deltas come from the concurrent forward-pass
+workstream's local-only edits to `src/engine/attention.ts`
+(fused/tiled SwiGLU, RoPE cos/sin cache, 4-way unrolled
+Q·K dot), which landed in the tree between the baseline
+bench and this run. Proof: a shadow tree with main's
+`attention.ts` and everything else local (including the
+cache) reproduces the baseline chunk-0 PPLs exactly —
+INT8 31.99, FP8 29.53. Token identity is unaffected
+either way: FP8 still holds 16/16, INT8 still diverges
+exactly as before (first differing position 2, 13/16).
+
+Follow-ups, sequenced (core done, nothing cancelled):
+- **Naive INT8 core.** lm_head INT8 at 93.64 ms vs FP32
+  51.63 ms is the scalar triple-loop integer core, not
+  dequantization. Vectorizing/blocking it is the next
+  tok/s lever for INT8.
+- **INT8 values are never read.** The integer core reads
+  codes/scales/analysis only, but the cache retains the
+  FP32 `values` array too — dropping it for INT8 would
+  cut the INT8 footprint ~100× (517 MiB → ~5 MiB of
+  analysis). Kept uniform for now; the saving is real.
+- **LRU vs cyclic access.** A token touches every weight
+  once, in order. If a model's dequantized weights exceed
+  the cap, LRU thrashes to ~0% hits on steady state. The
+  cap protects memory; a working-set-aware policy (or a
+  larger cap) is needed before this matters for big models.
+- **Transient staging peak.** `quantizeFp8` holds
+  `scaled` + `values` + `err` (3× weight size) while the
+  cache grows — the ~1.9 GiB bench-process peak. Streaming
+  the quantize, or staging under a memory budget, would
+  lower it.
+- **Bench script comment.** `scripts/bench-vnpu.ts`
+  still says each decode forward "re-derives the
+  staged-weight error bounds per call" — stale since the
+  cache; left untouched (shared file, other workstreams
+  active).
+- **Kernel-bench FP32 noise.** 2 timed reps on a shared
+  host give ±10× FP32 jitter on sub-ms shapes (gate/up
+  1.61 → 17.96 ms). More reps or interleaved medians
+  would firm up the kernel table.
 
 #### Attention throughput row — not measured
 

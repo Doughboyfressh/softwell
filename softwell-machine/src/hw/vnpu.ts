@@ -42,6 +42,23 @@
  * from the actual quantization errors by the triangle inequality —
  * never asserted, always computed. Attention instructions report the
  * theorems' own bounds (A1/A2/N2), evaluated on the actual data.
+ *
+ * Dequantization cache (2026-11-23): every staged-weight matmul used
+ * to re-derive the dequantized FP32 values + full QuantAnalysis from
+ * the staged payload — an O(weight-size) pass per call, ~210 calls
+ * per decode token. The dequantized values + analysis are pure
+ * functions of the staged payload, so the device now retains them
+ * per staged weight key (populated at stage time from the quantize
+ * call stageWeights already makes — zero extra compute at stage).
+ * The cache is coordinator-side host RAM, NOT modeled SRAM: it is
+ * accounted separately (dequantCacheStatus()), capped by an LRU
+ * (VNPU_DEQUANT_CACHE_BYTES, default 1 GiB), and invalidated by
+ * exactly the same events that drop the resident copy — re-stage
+ * under the same key, SRAM eviction, explicit evictWeights, and
+ * donor loss. A weight whose dequant does not fit the cap, or a
+ * cache disabled with dequantCacheBytes: 0, falls back to the old
+ * per-call re-derivation. See docs/VNPU.md §5.3 "Why the quantized
+ * path is slow" and the dequant-cache follow-up section.
  */
 
 import { decodeToFloat32, dtypeByteSize, encodeFromFloat32 } from "./vgpu.ts";
@@ -106,6 +123,17 @@ export const VNPU_SRAM_BYTES = VNPU_TILES * VNPU_TILE_SRAM_BYTES;
 export const VNPU_TILE = 128;
 /** Default execution format for matmuls that do not name one. */
 export const VNPU_DEFAULT_FORMAT = "int8" as const;
+/**
+ * Default dequantization-cache cap (host RAM, not modeled SRAM):
+ * 1 GiB. SmolLM-135M's dequantized weights are ~513 MiB (FP32 values
+ * for 134.5M params + a few MiB of QuantAnalysis), so the full model
+ * fits with ~2x headroom on the 7.7 GiB host; a model whose
+ * dequantized weights exceed the cap degrades to per-call
+ * re-derivation for the evicted weights (LRU). Override with
+ * VirtualNpuOpts.dequantCacheBytes; 0 disables the cache entirely
+ * (the pre-cache behaviour — every call re-derives).
+ */
+export const VNPU_DEQUANT_CACHE_BYTES = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Quantization
@@ -339,6 +367,47 @@ export function quantizeBf16(data: Float32Array, rows: number, cols: number): Bf
   };
 }
 
+/**
+ * One cached dequantization: the dequantized FP32 values + the
+ * QuantAnalysis for a staged weight, retained per staged key. This
+ * is exactly what stageWeights' quantize call already computed and
+ * what stagedToInt8 / stagedToFp8 / stagedToBf16 used to re-derive
+ * on every matmul — retaining it is bit-identical to recomputing
+ * it, because both are pure functions of the same staged payload.
+ * The codes/scales/bytes of the staged payload itself are NOT
+ * counted here (they are the SRAM entry's bytes); this counts only
+ * the extra host-RAM arrays the cache retains.
+ */
+export type CachedDequant = Int8Quantized | Fp8Quantized | Bf16Quantized;
+
+/** Host-RAM bytes a cached dequantization retains. */
+export function dequantBytes(q: CachedDequant): number {
+  return (
+    q.values.byteLength +
+    q.analysis.rowL1.byteLength +
+    q.analysis.colL1.byteLength +
+    q.analysis.rowErrMax.byteLength +
+    q.analysis.colErrMax.byteLength
+  );
+}
+
+/** Snapshot of the dequantization cache (host RAM, not modeled SRAM). */
+export interface DequantCacheStatus {
+  /** Cap in bytes (VNPU_DEQUANT_CACHE_BYTES by default; 0 = disabled). */
+  capBytes: number;
+  /** Host-RAM bytes currently retained by the cache. */
+  usedBytes: number;
+  /** Staged weights currently holding a cached dequantization. */
+  entries: number;
+  /** Matmuls served from the cache. */
+  hits: number;
+  /** Matmuls that re-derived the dequantization (first use after a
+   *  stage, after a cap eviction, or with the cache disabled). */
+  misses: number;
+  /** Cached dequantizations dropped by LRU to make room. */
+  evictions: number;
+}
+
 // ---------------------------------------------------------------------------
 // Matmul error bounds.
 //
@@ -524,6 +593,17 @@ interface SramEntry {
   bytes: number;
   payload: StagedPayload;
   lastUsed: number;
+  /**
+   * Cached dequantization for this weight (values + QuantAnalysis),
+   * retained from the stage-time quantize call. Undefined when the
+   * weight was never cached (SW-code: no FP32 values exist to cache),
+   * when it did not fit the dequant cap, or when it was dropped by
+   * LRU — in all three cases the next matmul re-derives it via
+   * stagedToInt8 / stagedToFp8 / stagedToBf16 and re-attaches it if
+   * the cap allows. Dies with the entry on re-stage, SRAM eviction,
+   * explicit evictWeights, and donor loss (see dropDequant).
+   */
+  dequant?: CachedDequant;
 }
 
 interface DeviceSram {
@@ -542,6 +622,14 @@ export interface VirtualNpuOpts {
    * staging hundreds of megabytes; production code never sets it.
    */
   sramBytes?: number;
+  /**
+   * Dequantization-cache cap in host-RAM bytes (default
+   * VNPU_DEQUANT_CACHE_BYTES, 1 GiB). 0 disables the cache: every
+   * matmul re-derives the dequantized weight + QuantAnalysis, the
+   * pre-cache behaviour. A single weight whose dequantization alone
+   * exceeds the cap is never cached.
+   */
+  dequantCacheBytes?: number;
 }
 
 function opForFormat(format: "int8" | "fp8" | "bf16" | SwMode): NpuOp {
@@ -602,6 +690,13 @@ export class VirtualNpu implements IVirtualNpu {
   private sramMisses = 0;
   private sramSpills = 0;
   private sramEvictions = 0;
+  /** Dequantization cache (host RAM, not modeled SRAM): cap, current
+   *  retained bytes, and hit/miss/eviction counters. */
+  private dequantCacheCapBytes: number;
+  private dequantCacheBytes = 0;
+  private dequantHits = 0;
+  private dequantMisses = 0;
+  private dequantEvictions = 0;
   private int8Matmuls = 0;
   private fp8Matmuls = 0;
   private swMatmuls = 0;
@@ -616,6 +711,12 @@ export class VirtualNpu implements IVirtualNpu {
     this.ram = opts.ram;
     this.defaultFormat = opts.defaultFormat ?? VNPU_DEFAULT_FORMAT;
     this.sramBytes = opts.sramBytes ?? VNPU_SRAM_BYTES;
+    if (opts.dequantCacheBytes !== undefined && opts.dequantCacheBytes < 0) {
+      throw new Error(
+        `vNPU: dequantCacheBytes must be >= 0, got ${opts.dequantCacheBytes}`,
+      );
+    }
+    this.dequantCacheCapBytes = opts.dequantCacheBytes ?? VNPU_DEQUANT_CACHE_BYTES;
   }
 
   // -- inventory ------------------------------------------------------------
@@ -675,18 +776,28 @@ export class VirtualNpu implements IVirtualNpu {
     const weightScale = opts?.weightScale ?? "per-channel";
     let payload: StagedPayload;
     let bytes: number;
+    // The quantize call below already computes the dequantized values
+    // + QuantAnalysis; retaining that result as the entry's dequant
+    // cache costs zero extra compute at stage time (it used to be
+    // thrown away and re-derived on every matmul). SW-code has no
+    // FP32 values to retain — its matmuls consume the packed payload
+    // directly — so it stages with no dequant entry.
+    let dequant: CachedDequant | undefined;
     if (format === "int8") {
       const q = quantizeInt8(data, rows, cols, weightScale, "row");
       payload = { kind: "int8", codes: q.codes, scales: q.scales, perChannel: q.perChannel };
       bytes = q.codes.byteLength + q.scales.byteLength + 16;
+      dequant = q;
     } else if (format === "fp8") {
       const q = quantizeFp8(data, rows, cols);
       payload = { kind: "fp8", codes: q.codes, scale: q.scale };
       bytes = q.codes.byteLength + 4 + 16;
+      dequant = q;
     } else if (format === "bf16") {
       const q = quantizeBf16(data, rows, cols);
       payload = { kind: "bf16", bytes: q.bytes };
       bytes = q.bytes.byteLength + 16;
+      dequant = q;
     } else {
       const packed = encodeMatrix(data, rows, cols, format);
       payload = { kind: "sw", packed };
@@ -704,7 +815,8 @@ export class VirtualNpu implements IVirtualNpu {
     // Re-staging a key drops its old resident copy first.
     this.dropResident(key);
     const sram = this.sramFor(nodeId);
-    // Evict LRU residents until the new weight fits.
+    // Evict LRU residents until the new weight fits. An evicted
+    // resident takes its cached dequantization with it.
     while (sram.usedBytes + bytes > this.sramBytes && sram.entries.size > 0) {
       let lruKey: string | null = null;
       let lruUsed = Infinity;
@@ -717,7 +829,10 @@ export class VirtualNpu implements IVirtualNpu {
       if (lruKey === null) break;
       const evicted = sram.entries.get(lruKey);
       sram.entries.delete(lruKey);
-      if (evicted !== undefined) sram.usedBytes -= evicted.bytes;
+      if (evicted !== undefined) {
+        sram.usedBytes -= evicted.bytes;
+        this.dropDequant(evicted);
+      }
       this.keyDevice.delete(lruKey);
       this.sramEvictions += 1;
     }
@@ -734,6 +849,7 @@ export class VirtualNpu implements IVirtualNpu {
     sram.usedBytes += bytes;
     this.keyDevice.set(key, nodeId);
     this.knownKeys.add(key);
+    if (dequant !== undefined) this.attachDequant(entry, dequant);
     return { key, deviceId: `vnpu-${nodeId}`, format, bytes, resident: true };
   }
 
@@ -777,7 +893,10 @@ export class VirtualNpu implements IVirtualNpu {
     };
   }
 
-  /** Remove a key's resident copy from whichever device holds it. */
+  /** Remove a key's resident copy from whichever device holds it.
+   *  The cached dequantization dies with the entry, so a later
+   *  re-stage under the same key can never serve stale values — the
+   *  new stage attaches the dequantization of the new payload. */
   private dropResident(key: string): boolean {
     const nodeId = this.keyDevice.get(key);
     if (nodeId === undefined) return false;
@@ -787,10 +906,78 @@ export class VirtualNpu implements IVirtualNpu {
       if (entry !== undefined) {
         sram.entries.delete(key);
         sram.usedBytes -= entry.bytes;
+        this.dropDequant(entry);
       }
     }
     this.keyDevice.delete(key);
     return true;
+  }
+
+  /**
+   * Drop one entry's cached dequantization, returning its bytes to
+   * the cache budget. Called whenever the entry dies (re-stage,
+   * SRAM eviction, explicit evict, donor loss) and by the LRU when
+   * room is needed — the SRAM entry itself stays resident, only the
+   * host-RAM memo goes, and the next matmul re-derives it.
+   */
+  private dropDequant(entry: SramEntry): void {
+    if (entry.dequant === undefined) return;
+    this.dequantCacheBytes -= dequantBytes(entry.dequant);
+    entry.dequant = undefined;
+  }
+
+  /**
+   * Attach a dequantization to a resident entry under the cap,
+   * evicting LRU dequantizations (other entries, by last matmul
+   * use) until it fits. Returns false and attaches nothing when
+   * the cache is disabled or this one dequantization alone exceeds
+   * the cap — the caller then pays per-call re-derivation.
+   */
+  private attachDequant(entry: SramEntry, q: CachedDequant): boolean {
+    if (this.dequantCacheCapBytes <= 0) return false;
+    const bytes = dequantBytes(q);
+    if (bytes > this.dequantCacheCapBytes) return false;
+    while (this.dequantCacheBytes + bytes > this.dequantCacheCapBytes) {
+      if (!this.evictDequantLru(entry)) return false;
+    }
+    entry.dequant = q;
+    this.dequantCacheBytes += bytes;
+    return true;
+  }
+
+  /** Evict the least-recently-used cached dequantization (never
+   *  `except`, the entry being attached/used). Returns false when
+   *  nothing is cached to evict. */
+  private evictDequantLru(except?: SramEntry): boolean {
+    let victim: SramEntry | null = null;
+    for (const sram of this.deviceSram.values()) {
+      for (const e of sram.entries.values()) {
+        if (e === except || e.dequant === undefined) continue;
+        if (victim === null || e.lastUsed < victim.lastUsed) victim = e;
+      }
+    }
+    if (victim === null) return false;
+    this.dropDequant(victim);
+    this.dequantEvictions += 1;
+    return true;
+  }
+
+  /** Snapshot of the dequantization cache (host RAM, not modeled SRAM). */
+  dequantCacheStatus(): DequantCacheStatus {
+    let entries = 0;
+    for (const sram of this.deviceSram.values()) {
+      for (const e of sram.entries.values()) {
+        if (e.dequant !== undefined) entries += 1;
+      }
+    }
+    return {
+      capBytes: this.dequantCacheCapBytes,
+      usedBytes: this.dequantCacheBytes,
+      entries,
+      hits: this.dequantHits,
+      misses: this.dequantMisses,
+      evictions: this.dequantEvictions,
+    };
   }
 
   private sramFor(nodeId: string): DeviceSram {
@@ -909,6 +1096,16 @@ export class VirtualNpu implements IVirtualNpu {
   private stagedToInt8(entry: SramEntry): Int8Quantized {
     const p = entry.payload;
     if (p.kind !== "int8") throw new Error(`vNPU: staged weight ${entry.key} is ${p.kind}, not int8`);
+    // Cache hit: the retained stage-time result, bit-identical to
+    // re-deriving it (same payload, pure function). The INT8 core
+    // reads only codes/scales/analysis, never values — but the
+    // retained object is the whole stage-time result, so nothing
+    // downstream can tell the hit path from the miss path.
+    if (entry.dequant !== undefined && entry.dequant.kind === "int8") {
+      this.dequantHits += 1;
+      return entry.dequant;
+    }
+    this.dequantMisses += 1;
     const values = new Float32Array(entry.rows * entry.cols);
     const err = new Float32Array(entry.rows * entry.cols);
     for (let r = 0; r < entry.rows; r++) {
@@ -919,7 +1116,7 @@ export class VirtualNpu implements IVirtualNpu {
         err[i] = s / 2;
       }
     }
-    return {
+    const q: Int8Quantized = {
       kind: "int8",
       codes: p.codes,
       scales: p.scales,
@@ -930,18 +1127,25 @@ export class VirtualNpu implements IVirtualNpu {
       rows: entry.rows,
       cols: entry.cols,
     };
+    this.attachDequant(entry, q);
+    return q;
   }
 
   private stagedToFp8(entry: SramEntry): Fp8Quantized {
     const p = entry.payload;
     if (p.kind !== "fp8") throw new Error(`vNPU: staged weight ${entry.key} is ${p.kind}, not fp8`);
+    if (entry.dequant !== undefined && entry.dequant.kind === "fp8") {
+      this.dequantHits += 1;
+      return entry.dequant;
+    }
+    this.dequantMisses += 1;
     const values = decodeToFloat32(p.codes, "float8_e4m3");
     const err = new Float32Array(values.length);
     for (let i = 0; i < values.length; i++) {
       values[i] *= p.scale;
       err[i] = FP8_REL_ERR * Math.abs(values[i]) + p.scale * FP8_SUBNORMAL_HALF_STEP;
     }
-    return {
+    const q: Fp8Quantized = {
       kind: "fp8",
       codes: p.codes,
       scale: p.scale,
@@ -950,17 +1154,24 @@ export class VirtualNpu implements IVirtualNpu {
       rows: entry.rows,
       cols: entry.cols,
     };
+    this.attachDequant(entry, q);
+    return q;
   }
 
   private stagedToBf16(entry: SramEntry): Bf16Quantized {
     const p = entry.payload;
     if (p.kind !== "bf16") throw new Error(`vNPU: staged weight ${entry.key} is ${p.kind}, not bf16`);
+    if (entry.dequant !== undefined && entry.dequant.kind === "bf16") {
+      this.dequantHits += 1;
+      return entry.dequant;
+    }
+    this.dequantMisses += 1;
     const values = decodeToFloat32(p.bytes, "bfloat16");
     const err = new Float32Array(values.length);
     for (let i = 0; i < values.length; i++) {
       err[i] = BF16_REL_ERR * Math.abs(values[i]) + BF16_ABS_ERR;
     }
-    return {
+    const q: Bf16Quantized = {
       kind: "bf16",
       bytes: p.bytes,
       values,
@@ -968,6 +1179,8 @@ export class VirtualNpu implements IVirtualNpu {
       rows: entry.rows,
       cols: entry.cols,
     };
+    this.attachDequant(entry, q);
+    return q;
   }
 
   // -- matmuls ----------------------------------------------------------------
@@ -1526,7 +1739,11 @@ export class VirtualNpu implements IVirtualNpu {
     const sram = this.deviceSram.get(nodeId);
     const sramBytesLost = sram?.usedBytes ?? 0;
     if (sram !== undefined) {
+      // The device's SRAM dies with it, and so do its cached
+      // dequantizations — the keys stay known, so a later use counts
+      // a miss and re-derives instead of serving stale values.
       for (const key of sram.entries.keys()) this.keyDevice.delete(key);
+      for (const entry of sram.entries.values()) this.dropDequant(entry);
       this.deviceSram.delete(nodeId);
     }
     return { devicesLost, sramBytesLost };

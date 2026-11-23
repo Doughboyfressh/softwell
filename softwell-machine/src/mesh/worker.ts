@@ -419,6 +419,22 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       await currentCache.free(seqId);
       return { freed: true };
     },
+    // Weight-fetch counters (GET /mesh/stats): the sums of every
+    // VramWeightLoader this worker has built (spawn-time loader
+    // included when it is one; disk loaders contribute 0, and a
+    // loader's counters survive model switches — they are cumulative
+    // for the process, like the orchestrator's weightBytesServed).
+    getStats: () => {
+      let tensorsFetched = 0;
+      let bytesFetched = 0;
+      for (const loader of loaders.values()) {
+        if (loader instanceof VramWeightLoader) {
+          tensorsFetched += loader.tensorsFetched;
+          bytesFetched += loader.bytesFetched;
+        }
+      }
+      return { tensorsFetched, bytesFetched };
+    },
   });
   const actualPort: number = await new Promise<number>((resolve, reject) => {
     const onError = (err: Error): void => reject(err);
@@ -457,6 +473,11 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
   }
   workerId = registered.workerId;
   log(`registered with ${opts.orchestratorUrl} as ${workerId} on ${opts.host}:${actualPort}`);
+  // Tag this worker's future vRAM KV allocations with its id, so the
+  // orchestrator's orphaned-chunk reaper can free them if this worker
+  // dies (docs/KV-DESIGN.md §7b). No-op for the host store (no access)
+  // and for accesses without setOwner (in-process fakes in tests).
+  opts.vramAccess?.setOwner?.(workerId);
 
   // 3. Heartbeat loop: report load, pick up newer assignments.
   async function doHeartbeat(): Promise<void> {

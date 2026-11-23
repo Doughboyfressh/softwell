@@ -351,6 +351,11 @@ export class VirtualServer implements ServingResolver, AdmissionControl {
   }
 
   getServerStatus(): ServerStatus {
+    // The registry is typed ModelRegistry, but tests substitute a plain
+    // FakeRegistry without the counter — read it defensively (0 when
+    // absent) so status never breaks on a minimal fake.
+    const served = (this.deps.registry as unknown as { weightBytesServed?: unknown })
+      .weightBytesServed;
     return {
       state: this.state,
       uptimeSec:
@@ -363,6 +368,7 @@ export class VirtualServer implements ServingResolver, AdmissionControl {
         this.active === null ? 0 : this.active.scheduler.pendingCount(),
       vm: this.vmInfoOrNull(),
       recentRequests: [...this.recent],
+      weights: { bytesServed: typeof served === "number" ? served : 0 },
     };
   }
 
