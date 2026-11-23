@@ -98,3 +98,34 @@ test("parseArgs: novel engine flags pass through", () => {
 test("parseArgs: invalid engine flag values throw", () => {
   assert.throws(() => parseArgs(["run", "x", "--attention", "bogus"]), /invalid engine option/);
 });
+
+test("parseArgs: --draft-model with speculative decoding", () => {
+  const opts = parseArgs([
+    "serve",
+    "demo/models/demo-100m",
+    "--decoding",
+    "speculative",
+    "--draft-model",
+    "demo/models/demo-10m",
+  ]);
+  assert.equal(opts.draftModelDir, "demo/models/demo-10m");
+  assert.equal(opts.engineOptions.decoding, "speculative");
+});
+
+test("parseArgs: --draft-model without speculative decoding throws", () => {
+  assert.throws(
+    () => parseArgs(["serve", "demo/models/demo-100m", "--draft-model", "demo/models/demo-10m"]),
+    /--draft-model requires --decoding speculative/,
+    "draft model without speculative decoding fails fast, not a silent n-gram fallback",
+  );
+  assert.throws(
+    () => parseArgs(["serve", "demo/models/demo-100m", "--decoding", "jacobi", "--draft-model", "demo/models/demo-10m"]),
+    /--draft-model requires --decoding speculative/,
+    "draft model with Jacobi also fails fast",
+  );
+});
+
+test("parseArgs: no --draft-model leaves the default (no draft model)", () => {
+  const opts = parseArgs(["serve", "demo/models/demo-100m", "--decoding", "speculative"]);
+  assert.equal(opts.draftModelDir, undefined);
+});

@@ -48,14 +48,25 @@ by both decoders.
 
 ## 1. The drafter: n-gram / context-copy drafting
 
-There is no separate draft model in this repo, so the drafter is built from
-what exists: the text itself. `NGramDrafter` proposes the next token by
+The default drafter is built from what exists: the text itself.
+`NGramDrafter` proposes the next token by
 finding the longest suffix of the context (up to 8 tokens) that has occurred
 before in the context and copying the token that followed its most recent
 occurrence; if no suffix of length ≥ 1 has occurred before, it repeats the
 last token. Drafting is sequential (each proposal extends the working
 context) and costs O(K · 8 · |context|) integer comparisons — no forward
 pass, no weights, no training.
+
+A real draft model is also supported: `ModelDrafter`
+(src/engine/novel-decoding.ts) runs a second, smaller loaded model
+autoregressively through its own `StageExecutor` (see
+src/scheduler/draft-model.ts; `--draft-model <dir>` on the CLI, which
+requires `--decoding speculative`). It replaces the n-gram drafter
+wherever the decoder accepts an `AsyncDrafter`, and changes α and
+nothing else in the theorems below — the verification logic and the
+exactness proofs are drafter-agnostic, provided (A3) holds. The draft
+model must share the target's tokenizer/vocabulary (checked loudly at
+activation); a mismatch is an error, never a silent fallback.
 
 This drafter is deliberately weak. It can only predict continuations that
 have already been seen, so its acceptance rate on a trained model generating

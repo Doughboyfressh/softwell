@@ -17,11 +17,14 @@
  *    bonus token. Greedy output is token-for-token identical to plain
  *    autoregressive decoding; sampled output is identically distributed
  *    (speculative sampling, Leviathan et al. 2023; Chen et al. 2023).
- *    There is no separate draft model in this repo, so the drafter is an
- *    n-gram / context-copy drafter (NGramDrafter): it copies continuations
- *    it has already seen in the prompt + generated text. It costs no
- *    forward pass at all — which is exactly why its acceptance rate, not
- *    its cost, decides whether speculation wins.
+ *    The drafter is pluggable: the default is an n-gram / context-copy
+ *    drafter (NGramDrafter) that costs no forward pass at all, and a
+ *    real draft model can be supplied as a ModelDrafter (below) — a
+ *    second loaded model that drafts autoregressively through its own
+ *    StageExecutor, i.e. through the same virtual-hardware path as the
+ *    target. Which drafter is used changes only the acceptance rate,
+ *    never the output: greedy output is token-for-token identical to
+ *    plain autoregressive decoding either way (Theorem S1).
  * 2. Parallel multi-token / Jacobi decoding (Theorem S2): guess a whole
  *    block of K tokens at once, refine every position in parallel with one
  *    batched forward per iteration, and stop at the fixed point. The fixed
@@ -272,6 +275,20 @@ export interface Drafter {
 }
 
 /**
+ * An async drafter: like Drafter, but drafting may run a model
+ * (ModelDrafter below) and therefore needs to await forwards. The
+ * SpeculativeDecoder accepts either shape and always awaits the result,
+ * so a synchronous Drafter keeps working unchanged. The optional
+ * `free()` releases per-sequence draft state (e.g. the draft model's
+ * KV cache for this sequence); the scheduler calls it best-effort when
+ * the sequence finishes, errors, or is cancelled.
+ */
+export interface AsyncDrafter {
+  draft(context: number[], count: number): Promise<number[]>;
+  free?(): Promise<void>;
+}
+
+/**
  * N-gram / context-copy drafter.
  *
  * To propose the next token after a context, find the longest suffix of
@@ -283,12 +300,13 @@ export interface Drafter {
  * next proposal. Cost is O(count * maxN * contextLength) integer compares
  * — no forward pass, no learned weights.
  *
- * This is the drafter the demo model gets: there is no trained draft model
- * in the repo, and a random-weight target has almost no predictable
- * continuations, so its acceptance rate is expected to be low. That is a
- * property of the (untrained) model, not of the decoding scheme — the
- * scheme is exact regardless, and the acceptance rate is measured, not
- * assumed (see test/novel-decoding.test.ts).
+ * This is the drafter the demo model gets by default: a random-weight
+ * target has almost no predictable continuations, so its acceptance
+ * rate is expected to be low. That is a property of the (untrained)
+ * model, not of the decoding scheme — the scheme is exact regardless,
+ * and the acceptance rate is measured, not assumed (see
+ * test/novel-decoding.test.ts). A real draft model (ModelDrafter,
+ * below) can replace it without changing the decoder.
  */
 export class NGramDrafter implements Drafter {
   readonly maxN: number;
@@ -333,6 +351,142 @@ export class NGramDrafter implements Drafter {
       }
     }
     return last;
+  }
+}
+
+/**
+ * A drafter that runs a real draft model autoregressively (greedy) —
+ * K tokens per draft() call — through the same StageExecutor /
+ * virtual-hardware path as the target: `executor.forward()` over the
+ * draft model's own stages, with its own PagedKVCache. No shortcuts
+ * around the VM, no direct host compute: the only difference from the
+ * target's executor is which model it was loaded from (see
+ * src/scheduler/draft-model.ts, which builds one shared draft executor
+ * per loaded draft model).
+ *
+ * One ModelDrafter serves ONE sequence: it keeps the draft model's KV
+ * for that sequence (`seqId`) plus the list of tokens already fed
+ * (`fed`). The context only ever grows by accepted tokens (the
+ * speculative decoder's contract), so each draft() call feeds only the
+ * tail the cache does not already hold — the longest common prefix of
+ * `fed` and the new context is skipped, and a divergent tail is
+ * re-fed, overwriting the rejected draft's K/V at those positions
+ * (the same append-overwrites invariant the target decoder relies on;
+ * see the module header). The last drafted token is never fed: if it
+ * is accepted it is fed as part of the next call's context tail, and
+ * if it is rejected it is overwritten there — exactly the target's
+ * carry-token pattern, one level down.
+ *
+ * Drafting stops early at EOS: tokens after a proposed EOS could never
+ * be used (an accepted EOS ends generation; a rejected one is replaced
+ * by the correction token and the next round drafts fresh), so they
+ * are not generated. A short draft is already handled by the decoder.
+ *
+ * Greedy drafting is deterministic: the same context through a fresh
+ * drafter always yields the same tokens. The decoder's exactness
+ * (Theorem S1) does not depend on the drafter at all — a wrong draft
+ * is simply rejected and corrected — so the ModelDrafter's acceptance
+ * rate is a measured property of the draft model, reported through
+ * the decoder's draftProposed/draftAccepted counters.
+ */
+export interface ModelDrafterOptions {
+  executor: StageExecutor;
+  cache: PagedKVCache;
+  seqId: string;
+  vocabSize: number;
+  eosTokenId: number;
+}
+
+export class ModelDrafter implements AsyncDrafter {
+  readonly vocabSize: number;
+  readonly eosTokenId: number;
+  /** Draft-model forward() calls (context feeds + draft steps). */
+  forwards = 0;
+
+  private readonly executor: StageExecutor;
+  private readonly cache: PagedKVCache;
+  private readonly seqId: string;
+  /** Tokens already fed into the draft cache, by absolute position. */
+  private fed: number[] = [];
+  /** Logits predicting the token after the last fed token (null until
+   *  the first feed). */
+  private pending: Float32Array | null = null;
+  private freed = false;
+
+  constructor(opts: ModelDrafterOptions) {
+    if (!Number.isInteger(opts.vocabSize) || opts.vocabSize < 1) {
+      throw new Error(`ModelDrafter: vocabSize must be a positive integer, got ${opts.vocabSize}`);
+    }
+    if (!Number.isInteger(opts.eosTokenId) || opts.eosTokenId < 0 || opts.eosTokenId >= opts.vocabSize) {
+      throw new Error(`ModelDrafter: eosTokenId ${opts.eosTokenId} out of vocab range [0, ${opts.vocabSize})`);
+    }
+    this.executor = opts.executor;
+    this.cache = opts.cache;
+    this.seqId = opts.seqId;
+    this.vocabSize = opts.vocabSize;
+    this.eosTokenId = opts.eosTokenId;
+  }
+
+  async draft(context: number[], count: number): Promise<number[]> {
+    if (count <= 0) return [];
+    if (context.length === 0) throw new Error("ModelDrafter: empty context");
+    if (this.freed) throw new Error("ModelDrafter: draft() called after free()");
+    for (const t of context) {
+      if (!Number.isInteger(t) || t < 0 || t >= this.vocabSize) {
+        throw new Error(`ModelDrafter: context token ${t} out of vocab range [0, ${this.vocabSize})`);
+      }
+    }
+
+    // Longest common prefix of the fed tokens and the new context: those
+    // positions are already in the draft cache with the right tokens.
+    let common = 0;
+    const n = Math.min(this.fed.length, context.length);
+    while (common < n && this.fed[common] === context[common]) common++;
+    this.fed.length = common;
+
+    if (common < context.length) {
+      // Feed the divergent tail in one batched forward; its last row's
+      // logits predict the first draft token. The first feed of the
+      // sequence is a prefill (common === 0); later feeds are decodes.
+      const tail = context.slice(common);
+      const positions = tail.map((_, i) => common + i);
+      const out = await forwardTokenRows(
+        this.executor,
+        this.cache,
+        this.seqId,
+        tail,
+        positions,
+        common === 0,
+      );
+      this.forwards += 1;
+      this.fed.push(...tail);
+      this.pending = logitsRow(out, tail.length - 1, this.vocabSize);
+    }
+
+    // Greedy-generate `count` tokens from the pending logits, feeding
+    // each drafted token except the last (see the class comment).
+    const out: number[] = [];
+    while (out.length < count) {
+      const tok = argmax(this.pending as Float32Array);
+      out.push(tok);
+      if (tok === this.eosTokenId) break;
+      if (out.length >= count) break;
+      const pos = this.fed.length;
+      const fwd = await forwardTokenRows(this.executor, this.cache, this.seqId, [tok], [pos], false);
+      this.forwards += 1;
+      this.fed.push(tok);
+      this.pending = logitsRow(fwd, 0, this.vocabSize);
+    }
+    return out;
+  }
+
+  /** Release this sequence's draft KV cache. Idempotent. */
+  async free(): Promise<void> {
+    if (this.freed) return;
+    this.freed = true;
+    this.fed = [];
+    this.pending = null;
+    await this.cache.free(this.seqId);
   }
 }
 
@@ -494,14 +648,19 @@ export class AutoregressiveDecoder {
 export interface SpeculativeDecoderOptions extends DecoderOptions {
   /** Draft length K (tokens proposed per round). Default 4. */
   draftLength?: number;
-  /** Drafter. Default: NGramDrafter(8). */
-  drafter?: Drafter;
+  /**
+   * Drafter. Default: NGramDrafter(8). A synchronous Drafter or an
+   * async one (ModelDrafter) — the decoder awaits the draft either
+   * way, so a real draft model plugs in without changing the
+   * verification logic or the exactness guarantee.
+   */
+  drafter?: Drafter | AsyncDrafter;
 }
 
 export class SpeculativeDecoder {
   private readonly opts: DecoderOptions;
   private readonly draftLength: number;
-  private readonly drafter: Drafter;
+  private readonly drafter: Drafter | AsyncDrafter;
 
   constructor(opts: SpeculativeDecoderOptions) {
     validateOptions(opts);
@@ -561,7 +720,7 @@ export class SpeculativeDecoder {
         // ---- Round type A: pending logits predict the next token. ----
         const nextPos = promptLen + result.tokens.length;
         const k = Math.min(this.draftLength, remaining);
-        const draft = this.drafter.draft(context(), k);
+        const draft = await this.drafter.draft(context(), k);
         if (draft.length === 0) {
           // Empty draft: plain autoregressive step (edge case, e.g. a
           // drafter that declines to propose). Exact by construction.
@@ -629,7 +788,7 @@ export class SpeculativeDecoder {
         // Draft the full K tokens after the carry (rows = 1 carry + K
         // drafts), so every round drafts the same number of tokens.
         const k = Math.min(this.draftLength, remaining);
-        const draft = this.drafter.draft(context(), k);
+        const draft = await this.drafter.draft(context(), k);
         const rows = [carryToken, ...draft];
         const positions = rows.map((_, i) => carryPos + i);
         const out = await forwardTokenRows(executor, cache, seqId, rows, positions, false);

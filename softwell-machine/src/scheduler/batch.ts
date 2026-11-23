@@ -44,7 +44,7 @@ import type {
   WorkerRole,
 } from "../contracts.ts";
 import { argmax } from "../engine/sampling.ts";
-import { NGramDrafter } from "../engine/novel-decoding.ts";
+import { NGramDrafter, type AsyncDrafter } from "../engine/novel-decoding.ts";
 
 /**
  * Rows per prefill chunk (runStageChain). See the chunked-prefill comment
@@ -98,6 +98,18 @@ export interface ContinuousBatchingSchedulerOptions {
   decoding?: DecodingMode;
   /** Draft length K for speculative decoding / block size for Jacobi. Default 4. */
   draftLength?: number;
+  /**
+   * Per-sequence async-drafter factory for speculative decoding: a
+   * real draft model (see src/scheduler/draft-model.ts). When present
+   * and decoding is "speculative", each greedy sequence drafts through
+   * its own drafter built by this factory (one ModelDrafter per
+   * sequence, each with its own draft KV cache); when absent, the
+   * shared NGramDrafter is used (the default). Ignored unless
+   * decoding is "speculative". The scheduler frees a sequence's
+   * drafter (its draft KV cache) when the sequence finishes, errors,
+   * or is cancelled.
+   */
+  draftDrafterFactory?: (seqId: string) => AsyncDrafter;
 }
 
 export interface StageRoute {
@@ -120,6 +132,14 @@ export interface SchedulerStepInfo {
   decodeRoutes: StageRoute[];
   /** Human-readable summary of the routing decisions this step. */
   routing: string;
+  /** Speculative-decoding totals for this step (0 when the step ran no
+   *  speculative rounds): draft tokens proposed / accepted across all
+   *  sequences, and rounds run. These are the measured acceptance
+   *  numbers for the step — real counts from whichever drafter ran
+   *  (n-gram or a draft model). */
+  specProposed: number;
+  specAccepted: number;
+  specRounds: number;
 }
 
 interface SequenceRecord {
@@ -137,6 +157,10 @@ interface SequenceRecord {
   specProposed: number;
   specAccepted: number;
   specRounds: number;
+  /** Per-sequence async drafter (a draft model), built lazily by
+   *  draftDrafterFactory on the first speculative round. Undefined
+   *  for n-gram drafting and non-speculative sequences. */
+  draftDrafter?: AsyncDrafter;
   /** Jacobi counters (measured, per sequence). */
   jacobiBlocks: number;
   jacobiIterations: number;
@@ -159,6 +183,8 @@ export class ContinuousBatchingScheduler implements Scheduler {
   private readonly draftLength: number;
   /** Free n-gram drafter (no target forward); shared by all sequences. */
   private readonly drafter = new NGramDrafter(8);
+  /** Per-sequence async-drafter factory (a draft model), or undefined. */
+  private readonly draftDrafterFactory?: (seqId: string) => AsyncDrafter;
   private readonly sequences: Map<string, SequenceRecord>;
   private readonly waitingOrder: string[];
   private stepInfo: SchedulerStepInfo | null;
@@ -175,6 +201,7 @@ export class ContinuousBatchingScheduler implements Scheduler {
     this.rolesByWorker = opts.rolesByWorker ?? {};
     this.decoding = opts.decoding ?? "autoregressive";
     this.draftLength = opts.draftLength ?? 4;
+    this.draftDrafterFactory = opts.draftDrafterFactory;
     if (!Number.isInteger(this.draftLength) || this.draftLength < 1) {
       throw new Error(
         `ContinuousBatchingScheduler: draftLength must be a positive integer, got ${opts.draftLength}`,
@@ -254,6 +281,7 @@ export class ContinuousBatchingScheduler implements Scheduler {
     record.state.status = "done";
     record.state.finishReason = "cancelled";
     void this.freeSequence(id).catch(() => undefined);
+    this.freeDraftDrafter(record);
     return true;
   }
 
@@ -288,6 +316,9 @@ export class ContinuousBatchingScheduler implements Scheduler {
       prefillRoutes: [],
       decodeRoutes: [],
       routing: "",
+      specProposed: 0,
+      specAccepted: 0,
+      specRounds: 0,
     };
     this.stepInfo = info;
     const produced: GeneratedToken[] = [];
@@ -611,7 +642,7 @@ export class ContinuousBatchingScheduler implements Scheduler {
       const remaining = this.remainingTokens(record);
       if (remaining <= 0) continue;
       const k = Math.min(this.draftLength, remaining);
-      const drafts = this.drafter.draft(this.draftContext(record), k);
+      const drafts = await this.draftFor(record, k);
       if (record.carry !== null) {
         const carry = record.carry;
         const rowStart = rows.length;
@@ -646,6 +677,7 @@ export class ContinuousBatchingScheduler implements Scheduler {
       const { record } = plan;
       if (record.state.status !== "decoding") continue;
       record.specRounds += 1;
+      info.specRounds += 1;
       if (plan.drafts.length === 0) {
         // Plain fallback step: sample from the single row's logits.
         const rowLogits = logitsRow(plan.rowStart);
@@ -669,8 +701,10 @@ export class ContinuousBatchingScheduler implements Scheduler {
               : logitsRow(plan.rowStart + i - 1)
             : logitsRow(plan.rowStart + i);
         record.specProposed += 1;
+        info.specProposed += 1;
         if ((plan.drafts[i] as number) === argmax(pred)) {
           record.specAccepted += 1;
+          info.specAccepted += 1;
           accepted += 1;
         } else {
           correction = argmax(pred);
@@ -965,6 +999,7 @@ export class ContinuousBatchingScheduler implements Scheduler {
       info.finished.push(state.id);
       // Best-effort: free the worker-side KV cache; never fail the step.
       void this.freeSequence(state.id).catch(() => undefined);
+      this.freeDraftDrafter(record);
     }
   }
 
@@ -974,5 +1009,33 @@ export class ContinuousBatchingScheduler implements Scheduler {
     record.state.error = message;
     info.errored.push(record.state.id);
     void this.freeSequence(record.state.id).catch(() => undefined);
+    this.freeDraftDrafter(record);
+  }
+
+  /**
+   * Draft `count` tokens for a sequence: through its per-sequence async
+   * drafter (a draft model) when a factory was provided, else through
+   * the shared synchronous n-gram drafter. Drafting is awaited either
+   * way — awaiting a synchronous draft is a no-op — so the two paths
+   * share one call site. Drafts run sequentially per sequence (one
+   * drafter at a time); batching draft forwards across sequences into
+   * one executor call is a follow-up, not a correctness requirement.
+   */
+  private async draftFor(record: SequenceRecord, count: number): Promise<number[]> {
+    const factory = this.draftDrafterFactory;
+    if (factory === undefined) return this.drafter.draft(this.draftContext(record), count);
+    if (record.draftDrafter === undefined) record.draftDrafter = factory(record.state.id);
+    return record.draftDrafter.draft(this.draftContext(record), count);
+  }
+
+  /**
+   * Best-effort release of a sequence's model-drafter state (its draft
+   * KV cache). A no-op for n-gram sequences (no drafter was built).
+   * Never throws: a failing free must not fail the step or the finish.
+   */
+  private freeDraftDrafter(record: SequenceRecord): void {
+    const drafter = record.draftDrafter;
+    record.draftDrafter = undefined;
+    if (drafter?.free !== undefined) void drafter.free().catch(() => undefined);
   }
 }

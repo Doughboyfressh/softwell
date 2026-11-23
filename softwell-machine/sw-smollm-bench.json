@@ -1,0 +1,138 @@
+[
+  {
+    "timestamp": "2026-11-23T05:22:42.390Z",
+    "setting": "weights=fp32 kv=fp32",
+    "weights": "fp32",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 3.86154,
+    "perplexity": 47.539,
+    "seMeanNll": 0.20664,
+    "pplLow": 38.664,
+    "pplHigh": 58.451,
+    "chunkPpls": [
+      28.43,
+      55.82,
+      75.26,
+      42.77
+    ],
+    "prefillTokPerSec": 1.881,
+    "decodeTokPerSec": 1.005,
+    "loadSec": 3.1,
+    "weightBytes": 538060032,
+    "genTokens": 4,
+    "genText": " to play with a",
+    "loadAvg": [
+      2.87,
+      1.66,
+      1.29
+    ],
+    "node": "v24.22.1"
+  },
+  {
+    "timestamp": "2026-11-23T05:31:25.814Z",
+    "setting": "weights=sw4 kv=fp32",
+    "weights": "sw4",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 4.16382,
+    "perplexity": 64.317,
+    "seMeanNll": 0.16424,
+    "pplLow": 54.575,
+    "pplHigh": 75.797,
+    "chunkPpls": [
+      45.02,
+      61.27,
+      99.79,
+      62.16
+    ],
+    "prefillTokPerSec": 0.588,
+    "decodeTokPerSec": 0.734,
+    "loadSec": 52.8,
+    "weightBytes": 189195521,
+    "genTokens": 4,
+    "genText": " to be a house",
+    "loadAvg": [
+      2.88,
+      2.54,
+      1.72
+    ],
+    "node": "v24.22.1"
+  },
+  {
+    "timestamp": "2026-11-23T05:36:29.293Z",
+    "setting": "weights=sw3 kv=fp32",
+    "weights": "sw3",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 6.49886,
+    "perplexity": 664.383,
+    "seMeanNll": 0.16741,
+    "pplLow": 561.97,
+    "pplHigh": 785.459,
+    "chunkPpls": [
+      548.27,
+      870.95,
+      892.02,
+      457.42
+    ],
+    "prefillTokPerSec": 1.009,
+    "decodeTokPerSec": 0.747,
+    "loadSec": 15.4,
+    "weightBytes": 172385537,
+    "genTokens": 4,
+    "genText": " the day the day",
+    "loadAvg": [
+      1.95,
+      2.51,
+      2
+    ],
+    "node": "v24.22.1"
+  },
+  {
+    "timestamp": "2026-11-23T05:41:29.681Z",
+    "setting": "weights=sw2 kv=fp32",
+    "weights": "sw2",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 21.11175,
+    "perplexity": 1474741498.437,
+    "seMeanNll": 0.16536,
+    "pplLow": 1249972998.765,
+    "pplHigh": 1739927573.924,
+    "chunkPpls": [
+      1093490794.83,
+      2283835866.63,
+      1579085263,
+      1199438552.81
+    ],
+    "prefillTokPerSec": 1.017,
+    "decodeTokPerSec": 0.754,
+    "loadSec": 14.6,
+    "weightBytes": 155575553,
+    "genTokens": 4,
+    "genText": ".academthon follows",
+    "loadAvg": [
+      1.27,
+      1.71,
+      1.77
+    ],
+    "node": "v24.22.1"
+  }
+]

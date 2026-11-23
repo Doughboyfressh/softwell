@@ -28,6 +28,7 @@ import type {
   EngineOptions,
   ModelEntry,
   ModelManifest,
+  Tokenizer,
   VirtualMachine,
   VramAllocation,
   VramWeightMap,
@@ -36,7 +37,12 @@ import type {
 import { downloadModel, resolveModelRef } from "../model/hub.ts";
 import { loadManifest, tensorFileFor } from "../model/loader.ts";
 import { safetensorsHeaderLength } from "../model/manifest.ts";
-import { BpeTokenizer, loadTokenizer } from "../model/tokenizer.ts";
+import {
+  ByteLevelTokenizer,
+  BpeTokenizer,
+  loadTokenizer,
+  tokenizerFromBytes,
+} from "../model/tokenizer.ts";
 import { MeshError } from "../mesh/protocol.ts";
 
 /** KV-cache headroom reserved alongside the weights in the fit check. */
@@ -269,6 +275,40 @@ export class ModelRegistry {
   }
 
   /**
+   * The tokenizer for a staged model, read from the vSSD copy
+   * (`models/<id>/tokenizer.json`, plus `tokenizer_config.json` and
+   * `config.json` for the BPE special-token overrides) — never from the
+   * model directory on disk. Activation calls this, so re-activating a
+   * model works after its directory is gone, as long as it was staged.
+   * A model with no staged tokenizer.json gets the byte-level defaults
+   * (the same fallback `loadTokenizer` gives a missing file); staged
+   * JSON that fails to parse throws. Throws when the VM is not booted.
+   */
+  async getTokenizer(modelId: string): Promise<Tokenizer> {
+    const state = stateOf(this);
+    const vm = state.deps.vm();
+    if (vm === null) {
+      throw new Error(
+        `cannot read the staged tokenizer for model "${modelId}": virtual machine is not booted`,
+      );
+    }
+    const readStaged = async (rel: string): Promise<Uint8Array | undefined> => {
+      try {
+        return await vm.ssd.getObject(`models/${modelId}/${rel}`);
+      } catch {
+        return undefined;
+      }
+    };
+    const tokenizerJson = await readStaged("tokenizer.json");
+    if (tokenizerJson === undefined) return new ByteLevelTokenizer();
+    return tokenizerFromBytes({
+      tokenizerJson,
+      tokenizerConfigJson: await readStaged("tokenizer_config.json"),
+      configJson: await readStaged("config.json"),
+    });
+  }
+
+  /**
    * Everything a worker needs to build a VramWeightLoader for a staged
    * model, or null when the model is not staged. Served as JSON by
    * GET /mesh/weights/map?model=<id>.
@@ -330,6 +370,12 @@ export class ModelRegistry {
    * Load a model: resolve the reference, read its manifest and tokenizer,
    * fit-check the weights against vRAM, stage every file to vSSD, then
    * stage each *.safetensors shard into vRAM (one allocation per shard).
+   *
+   * This is the only place the model directory is read from disk — the
+   * ingest entry point. Activation never re-reads it: it takes the
+   * manifest from `getManifest` (the staged copy recorded here) and the
+   * tokenizer from `getTokenizer` (the staged vSSD copy), so a model
+   * stays activatable after its directory is gone.
    *
    * A fit failure never throws: the entry is returned with status "error"
    * and a message naming the weights, the headroom and the vRAM total, and

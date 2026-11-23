@@ -1,0 +1,129 @@
+{
+  "label": "forward-opt-before",
+  "phase": "before",
+  "timestamp": "2026-11-23T05:26:00.538Z",
+  "model": "smollm-135m",
+  "params": 134015488,
+  "host": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 4,
+    "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+    "totalMemMiB": 7934,
+    "freeMemMiB": 1069,
+    "loadavg": [
+      0.37,
+      1.5,
+      1.46
+    ]
+  },
+  "short": {
+    "prompt": "The capital of France is",
+    "promptTokens": 5,
+    "maxTokens": 16,
+    "prefillMs": [
+      3191,
+      3335,
+      3042
+    ],
+    "medianPrefillMs": 3191,
+    "generateRuns": [
+      {
+        "rep": 1,
+        "ms": 16133,
+        "tokPerSec": 0.99,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      },
+      {
+        "rep": 2,
+        "ms": 10983,
+        "tokPerSec": 1.46,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      },
+      {
+        "rep": 3,
+        "ms": 7708,
+        "tokPerSec": 2.08,
+        "tokens": [
+          7042,
+          30,
+          198,
+          504,
+          3575,
+          282,
+          4649,
+          314,
+          260,
+          3575,
+          282,
+          4649,
+          30,
+          198,
+          504,
+          3575
+        ],
+        "text": " Paris.\nThe capital of France is the capital of France.\nThe capital"
+      }
+    ],
+    "medianGenerateTokPerSec": 1.46,
+    "tokenIdentityAcrossReps": true,
+    "decodeOnlyMs": [
+      393,
+      411,
+      642,
+      900,
+      726,
+      683,
+      716,
+      798,
+      799,
+      894,
+      622,
+      664,
+      902,
+      687,
+      810,
+      741
+    ],
+    "medianDecodeMs": 726,
+    "decodeOnlyTokPerSec": 1.38
+  },
+  "long": null
+}

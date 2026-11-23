@@ -223,7 +223,10 @@ export class BpeTokenizer implements Tokenizer {
     const padFromAdded = this.addedByContent.get("<pad>")?.id;
     this.bosTokenId = options.bosTokenId ?? bosFromAdded ?? DEFAULT_BOS_TOKEN_ID;
     this.eosTokenId = options.eosTokenId ?? eosFromAdded ?? DEFAULT_EOS_TOKEN_ID;
-    this.padTokenId = options.padTokenId ?? padFromAdded ?? DEFAULT_PAD_TOKEN_ID;
+    // Pad defaults to EOS when unspecified (the GPT-2 / HF convention):
+    // a pad id that is really a vocab token would corrupt decode(), and
+    // generation never pads with a real token.
+    this.padTokenId = options.padTokenId ?? padFromAdded ?? this.eosTokenId;
     this.specialIds.add(this.bosTokenId);
     this.specialIds.add(this.eosTokenId);
     this.specialIds.add(this.padTokenId);
@@ -554,12 +557,36 @@ function asId(value: unknown): number | undefined {
 }
 
 /**
+ * Extra special-token sources for bpeTokenizerFromJson, read from the
+ * sibling files of tokenizer.json in a model directory:
+ * - `bosToken` / `eosToken` / `padToken`: token contents from
+ *   tokenizer_config.json (bos_token / eos_token / pad_token), resolved
+ *   against the added tokens, then the vocab.
+ * - `bosTokenId` / `eosTokenId` / `padTokenId`: numeric ids from
+ *   config.json (bos_token_id / eos_token_id / pad_token_id).
+ * Anything tokenizer.json itself carries wins over these overrides.
+ * They exist because GPT-2-style tokenizer.json files (SmolLM included)
+ * carry no bos/eos fields at all: without them the tokenizer falls back
+ * to the demo-vocab defaults 256/257/258, which are real vocab tokens
+ * for such models ("ĠĠ", "re", "on" in SmolLM) — decode() then silently
+ * drops those tokens from generated text.
+ */
+export interface BpeTokenizerOverrides {
+  bosToken?: string;
+  eosToken?: string;
+  padToken?: string;
+  bosTokenId?: number;
+  eosTokenId?: number;
+  padTokenId?: number;
+}
+
+/**
  * Build a BpeTokenizer from a parsed tokenizer.json object, or null when
  * it does not carry a usable BPE model (model.type is not "BPE", or the
  * vocab or merges are empty). Unknown normalizer / pre-tokenizer shapes
  * are ignored (with the fallback split) rather than failing the parse.
  */
-export function bpeTokenizerFromJson(raw: unknown): BpeTokenizer | null {
+export function bpeTokenizerFromJson(raw: unknown, overrides: BpeTokenizerOverrides = {}): BpeTokenizer | null {
   if (!isRecord(raw)) return null;
   const model = raw["model"];
   if (!isRecord(model) || model["type"] !== "BPE") return null;
@@ -593,20 +620,32 @@ export function bpeTokenizerFromJson(raw: unknown): BpeTokenizer | null {
   const unkContent = typeof model["unk_token"] === "string" ? model["unk_token"] : undefined;
   const unkTokenId =
     unkContent !== undefined ? (addedByContent.get(unkContent) ?? vocab[unkContent]) : undefined;
-  const bosFromString =
-    typeof raw["bos_token"] === "string" ? addedByContent.get(raw["bos_token"]) : undefined;
-  const eosFromString =
-    typeof raw["eos_token"] === "string" ? addedByContent.get(raw["eos_token"]) : undefined;
-  const padFromString =
-    typeof raw["pad_token"] === "string" ? addedByContent.get(raw["pad_token"]) : undefined;
+  // Resolve a special-token content string (from tokenizer.json itself or
+  // from tokenizer_config.json via `overrides`) to an id: added tokens
+  // first, then the plain vocab (added tokens are usually in both).
+  const resolveContent = (content: string | undefined): number | undefined =>
+    content === undefined ? undefined : (addedByContent.get(content) ?? vocab[content]);
+  const bosFromString = resolveContent(
+    overrides.bosToken ?? (typeof raw["bos_token"] === "string" ? raw["bos_token"] : undefined),
+  );
+  const eosFromString = resolveContent(
+    overrides.eosToken ?? (typeof raw["eos_token"] === "string" ? raw["eos_token"] : undefined),
+  );
+  const padFromString = resolveContent(
+    overrides.padToken ?? (typeof raw["pad_token"] === "string" ? raw["pad_token"] : undefined),
+  );
+
+  const bosTokenId = asId(raw["bos_token_id"]) ?? bosFromString ?? asId(overrides.bosTokenId);
+  const eosTokenId = asId(raw["eos_token_id"]) ?? eosFromString ?? asId(overrides.eosTokenId);
+  const padTokenId = asId(raw["pad_token_id"]) ?? padFromString ?? asId(overrides.padTokenId);
 
   return new BpeTokenizer({
     vocab,
     merges,
     addedTokens,
-    bosTokenId: asId(raw["bos_token_id"]) ?? bosFromString,
-    eosTokenId: asId(raw["eos_token_id"]) ?? eosFromString,
-    padTokenId: asId(raw["pad_token_id"]) ?? padFromString,
+    bosTokenId,
+    eosTokenId,
+    padTokenId,
     unkTokenId,
     addBos: typeof raw["add_bos_token"] === "boolean" ? raw["add_bos_token"] : undefined,
     addEos: typeof raw["add_eos_token"] === "boolean" ? raw["add_eos_token"] : undefined,
@@ -669,15 +708,94 @@ function parseTokenizerJson(raw: unknown): ByteLevelTokenizerOptions {
   return options;
 }
 
+/** Best-effort JSON read: undefined when the file is missing or invalid. */
+function readJsonIfExists(filePath: string): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A special-token entry from tokenizer_config.json: either a bare string
+ * ("<|endoftext|>") or an object with a "content" string.
+ */
+function tokenContent(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (isRecord(value) && typeof value["content"] === "string") return value["content"];
+  return undefined;
+}
+
+/**
+ * Build a tokenizer from raw file bytes instead of a directory — the
+ * activation path (src/server/registry.ts `getTokenizer`) reads
+ * tokenizer.json (+ tokenizer_config.json + config.json) out of staged
+ * vSSD objects and parses them here, so activation never touches the
+ * model directory on disk. Mirrors `loadTokenizer` exactly, including
+ * the BPE path and the byte-level fallback; a missing tokenizer.json
+ * (undefined input) yields the byte-level defaults, and invalid JSON
+ * throws a clear Error naming the staged file.
+ */
+export interface TokenizerBytesInput {
+  /** Raw bytes (or text) of the staged tokenizer.json. */
+  tokenizerJson?: Uint8Array | string;
+  /** Raw bytes (or text) of the staged tokenizer_config.json. */
+  tokenizerConfigJson?: Uint8Array | string;
+  /** Raw bytes (or text) of the staged config.json. */
+  configJson?: Uint8Array | string;
+}
+
+function parseJsonBytes(bytes: Uint8Array | string, label: string): unknown {
+  const text = typeof bytes === "string" ? bytes : new TextDecoder().decode(bytes);
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`invalid JSON in ${label}: ${(err as Error).message}`);
+  }
+}
+
+export function tokenizerFromBytes(input: TokenizerBytesInput): Tokenizer {
+  if (input.tokenizerJson === undefined) return new ByteLevelTokenizer();
+  const raw = parseJsonBytes(input.tokenizerJson, "staged tokenizer.json");
+  const tokConfig =
+    input.tokenizerConfigJson !== undefined
+      ? parseJsonBytes(input.tokenizerConfigJson, "staged tokenizer_config.json")
+      : undefined;
+  const modelConfig =
+    input.configJson !== undefined
+      ? parseJsonBytes(input.configJson, "staged config.json")
+      : undefined;
+  const overrides: BpeTokenizerOverrides = {
+    bosToken: tokenContent(isRecord(tokConfig) ? tokConfig["bos_token"] : undefined),
+    eosToken: tokenContent(isRecord(tokConfig) ? tokConfig["eos_token"] : undefined),
+    padToken: tokenContent(isRecord(tokConfig) ? tokConfig["pad_token"] : undefined),
+    bosTokenId: asId(isRecord(modelConfig) ? modelConfig["bos_token_id"] : undefined),
+    eosTokenId: asId(isRecord(modelConfig) ? modelConfig["eos_token_id"] : undefined),
+    padTokenId: asId(isRecord(modelConfig) ? modelConfig["pad_token_id"] : undefined),
+  };
+  return bpeTokenizerFromJson(raw, overrides) ?? new ByteLevelTokenizer(parseTokenizerJson(raw));
+}
+
 /**
  * Load a tokenizer from a model directory. Reads tokenizer.json when
  * present: a usable HF BPE model (non-empty vocab AND merges) yields a
  * BpeTokenizer; otherwise the simple shape, or HF shape with added_tokens
  * for the specials, yields a ByteLevelTokenizer; a missing file falls
  * back to the byte-level defaults.
+ *
+ * For the BPE path, bos/eos/pad are also resolved from the sibling
+ * tokenizer_config.json (token contents) and config.json (numeric ids),
+ * since GPT-2-style tokenizer.json files carry no bos/eos fields and the
+ * demo-vocab defaults (256/257/258) would otherwise be reported as the
+ * specials — and decode() would drop those real tokens from output.
+ *
+ * This is the ingest-side entry point only: activation reads the
+ * already-staged files from vSSD via `tokenizerFromBytes` instead.
  */
 export function loadTokenizer(dir: string): Tokenizer {
-  const filePath = path.join(path.resolve(dir), "tokenizer.json");
+  const absDir = path.resolve(dir);
+  const filePath = path.join(absDir, "tokenizer.json");
   if (!fs.existsSync(filePath)) return new ByteLevelTokenizer();
   let raw: unknown;
   try {
@@ -685,7 +803,17 @@ export function loadTokenizer(dir: string): Tokenizer {
   } catch (err) {
     throw new Error(`invalid JSON in ${filePath}: ${(err as Error).message}`);
   }
-  return bpeTokenizerFromJson(raw) ?? new ByteLevelTokenizer(parseTokenizerJson(raw));
+  const tokConfig = readJsonIfExists(path.join(absDir, "tokenizer_config.json"));
+  const modelConfig = readJsonIfExists(path.join(absDir, "config.json"));
+  const overrides: BpeTokenizerOverrides = {
+    bosToken: tokenContent(isRecord(tokConfig) ? tokConfig["bos_token"] : undefined),
+    eosToken: tokenContent(isRecord(tokConfig) ? tokConfig["eos_token"] : undefined),
+    padToken: tokenContent(isRecord(tokConfig) ? tokConfig["pad_token"] : undefined),
+    bosTokenId: asId(isRecord(modelConfig) ? modelConfig["bos_token_id"] : undefined),
+    eosTokenId: asId(isRecord(modelConfig) ? modelConfig["eos_token_id"] : undefined),
+    padTokenId: asId(isRecord(modelConfig) ? modelConfig["pad_token_id"] : undefined),
+  };
+  return bpeTokenizerFromJson(raw, overrides) ?? new ByteLevelTokenizer(parseTokenizerJson(raw));
 }
 
 /**
