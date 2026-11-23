@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, softwell-machine]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: softwell-machine/package-lock.json
+      - working-directory: softwell-machine
+        run: npm ci
+      - working-directory: softwell-machine
+        run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: softwell-machine/package-lock.json
+      - working-directory: softwell-machine
+        run: npm ci
+      - working-directory: softwell-machine
+        run: npm run make-demo-model && npm run make-demo-model-100m
+      - working-directory: softwell-machine
+        run: node --test --test-concurrency=1 --test-shard=${{ matrix.shard }} test/*.test.ts
