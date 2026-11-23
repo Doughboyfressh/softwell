@@ -1,0 +1,153 @@
+{
+  "label": "before",
+  "date": "2026-11-22T20:46:07.024Z",
+  "model": "demo-100m",
+  "params": 104365056,
+  "workers": 1,
+  "mesh_port": 18510,
+  "api_port": 18520,
+  "prompt": "Hello world",
+  "max_tokens": 8,
+  "temperature": 0,
+  "host": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 4,
+    "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+    "total_mem_mib": 7934,
+    "free_mem_mib": 6695,
+    "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        1239        5253          49        1774        6694\nSwap:           1023         417         606",
+    "loadavg": [
+      5.63,
+      2.37,
+      1.27
+    ]
+  },
+  "runs": [
+    {
+      "rep": 1,
+      "ttft_ms": 9491,
+      "decode_tok_per_s": 2.09,
+      "total_ms": 13319,
+      "content_tokens": 8,
+      "data_events": 9,
+      "content": "CCCCCCCC"
+    },
+    {
+      "rep": 2,
+      "ttft_ms": 10180,
+      "decode_tok_per_s": 2.29,
+      "total_ms": 13679,
+      "content_tokens": 8,
+      "data_events": 9,
+      "content": "CCCCCCCC"
+    },
+    {
+      "rep": 3,
+      "ttft_ms": 5413,
+      "decode_tok_per_s": 3.11,
+      "total_ms": 7985,
+      "content_tokens": 8,
+      "data_events": 9,
+      "content": "CCCCCCCC"
+    }
+  ],
+  "summary": {
+    "median_ttft_ms": 9491,
+    "ttft_ms_range": [
+      5413,
+      10180
+    ],
+    "median_decode_tok_per_s": 2.29,
+    "decode_tok_per_s_range": [
+      2.09,
+      3.11
+    ],
+    "median_total_ms": 13319,
+    "total_ms_range": [
+      7985,
+      13679
+    ]
+  },
+  "server_status": {
+    "state": "ready",
+    "uptimeSec": 0.413,
+    "activeModelId": "demo-100m",
+    "models": [
+      {
+        "id": "demo-100m",
+        "source": {
+          "kind": "local",
+          "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m"
+        },
+        "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m",
+        "status": "ready",
+        "vramBytes": 417473018,
+        "requestsServed": 0,
+        "tokensGenerated": 0,
+        "params": 104365056,
+        "weightBytes": 417460224,
+        "numLayers": 12,
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "tokenizerKind": "byte-level",
+        "weightVaddr": 0,
+        "loadedAt": 1795380450528
+      }
+    ],
+    "requests": {
+      "active": 0,
+      "queued": 0,
+      "completed": 0,
+      "rejected": 0,
+      "cancelled": 0
+    },
+    "tokensPerSec": 0,
+    "queueDepth": 0,
+    "vm": {
+      "vram": {
+        "totalBytes": 8589934592,
+        "usedBytes": 1107296256,
+        "freeBytes": 7482638336,
+        "pages": 264,
+        "nodes": 1
+      },
+      "gpu": {
+        "devices": [
+          {
+            "nodeId": "worker-mwsb4bis-2ghegxyy",
+            "device": "cpu",
+            "flopsPerSec": 1339655901.0693233
+          }
+        ],
+        "totalFlopsPerSec": 1339655901.0693233,
+        "kernelsCompleted": 0,
+        "kernelsFailed": 0
+      },
+      "cpu": {
+        "nodes": 1,
+        "totalCores": 4,
+        "queued": 0,
+        "completed": 0,
+        "failed": 0,
+        "nodesReportingCores": 1,
+        "nodesAssumedCores": 0
+      },
+      "ssd": {
+        "objects": 6,
+        "totalBytes": 457224554,
+        "nodes": 1
+      },
+      "nodes": [
+        {
+          "nodeId": "worker-mwsb4bis-2ghegxyy",
+          "device": "cpu",
+          "state": "healthy"
+        }
+      ]
+    },
+    "recentRequests": []
+  }
+}

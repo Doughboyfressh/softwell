@@ -136,11 +136,23 @@ pipeline is real, the speed is whatever the hardware underneath is.
 - **The vSSD manifest is coordinator-local** (persisted to a JSON file,
   best-effort). Losing the orchestrator loses the object index even
   though the chunks survive on donors.
-- **Workers load stage weights from a local model directory.** The
-  vSSD → vRAM staging path is implemented and proven, but the stage
-  executor's `WeightLoader` still reads local disk. The production path
-  is a `VramWeightLoader` (weights served from pooled vRAM) — the
-  interface for it already exists (`WeightLoader`); it is not written yet.
+- **Workers load stage weights from pooled vRAM, not from disk.**
+  At activation the worker asks the orchestrator for the staged
+  manifest + weight map (`GET /mesh/weights/map`) and builds a
+  `VramWeightLoader` (`src/model/vram-loader.ts`), whose tensor fetches
+  hit the orchestrator's binary endpoint (`GET /mesh/weights`,
+  octet-stream). The disk loader (`SafetensorsWeightLoader`) remains
+  only as a fallback for models the orchestrator has not staged. The
+  model directory is still read once at ingest (manifest, tokenizer,
+  and staging the files to vSSD — see `ModelRegistry.load`), and a
+  fresh worker process still needs a `--model-dir` to boot, but no
+  weight bytes come from disk at inference time. Proven by
+  `test/vram-weights-proof.test.ts` (generation with the model
+  directory renamed away) — see `docs/VRAM-WEIGHTS.md`. One caveat,
+  also documented there: the live worker-restart leg of that proof
+  failed once under heavy host contention (a vRAM page read as
+  unavailable on all copies), but has since passed twice on a quiet
+  host (standalone and inside `npm test`, 2026-11-22).
 - **Stage execution bypasses the vGPU coordinator.** The mesh worker
   runs the engine's math in-process — which *is* the vGPU's donor-side
   kernel execution (the same `CpuKernels` code) — but the per-op
@@ -149,7 +161,11 @@ pipeline is real, the speed is whatever the hardware underneath is.
   to become async and is documented as such in the code, not done here.
 - **The scheduler's KV cache is worker-local**, not allocated out of
   pooled vRAM. The block size matches the vRAM page model, but the
-  integration (cache blocks as vRAM allocations) is future work.
+  integration (cache blocks as vRAM allocations) is future work. A
+  vRAM-backed prototype exists (`VramPagedKVCache`,
+  `src/scheduler/kvcache-vram.ts`, 2026-11-22) but is not wired into
+  the serving path, and its own measurements put a vRAM KV read at
+  ~19 ms vs ~0.02 ms from host memory — see `docs/VRAM-WEIGHTS.md`.
 
 ## Mapping onto the existing softwell repo
 

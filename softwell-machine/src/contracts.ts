@@ -104,6 +104,40 @@ export interface WeightLoader {
   close(): void;
 }
 
+/**
+ * Where one tensor's raw bytes live in pooled vRAM. Staged bytes are the
+ * RAW shard file bytes (hypervisor.stageToVram streams vSSD -> vRAM), so
+ * a tensor's bytes sit at `vaddr + headerLen + dataOffsets[0]` for
+ * `dataOffsets[1] - dataOffsets[0]` bytes, where `headerLen` is the
+ * safetensors header length (8-byte prefix + JSON) of the shard that
+ * holds the tensor. `allocId` names the vRAM allocation (one per shard)
+ * so the bytes can be re-fetched after healing. `dtype`/`shape` repeat
+ * the manifest's TensorMeta so a loader can validate what it fetched.
+ */
+export interface VramTensorLocation {
+  allocId: string;
+  vaddr: VAddr;
+  headerLen: number;
+  dataOffsets: [number, number];
+  dtype: WeightDtype;
+  shape: number[];
+}
+
+/** Tensor name -> its location in pooled vRAM (one entry per tensor). */
+export type VramWeightMap = Record<string, VramTensorLocation>;
+
+/**
+ * What a worker needs to build a VramWeightLoader for a staged model:
+ * the manifest (config + tensor metadata) plus the weight map. Served
+ * as JSON by GET /mesh/weights/map?model=<id>; the tensor bytes
+ * themselves travel separately as octet-stream (GET /mesh/weights).
+ */
+export interface WeightMapResponse {
+  modelId: string;
+  manifest: ModelManifest;
+  weightMap: VramWeightMap;
+}
+
 /** Minimal tokenizer contract. The reference impl is byte-level (see model/tokenizer.ts). */
 export interface Tokenizer {
   readonly vocabSize: number;

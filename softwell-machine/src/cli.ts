@@ -62,9 +62,10 @@ import { downloadModel, resolveModelRef } from "./model/hub.ts";
 import { plan, replan } from "./planner/planner.ts";
 import { WorkerRegistry } from "./mesh/registry.ts";
 import { createMeshServer, MeshClient } from "./mesh/protocol.ts";
+import type { MeshServerHandlers } from "./mesh/protocol.ts";
 import { ContinuousBatchingScheduler } from "./scheduler/batch.ts";
 import { sampleLogits } from "./engine/sampling.ts";
-import { ModelRegistry } from "./server/registry.ts";
+import { ModelRegistry, createWeightHandlers } from "./server/registry.ts";
 import { VirtualServer } from "./server/server.ts";
 import type { ServingContextFactory } from "./server/server.ts";
 import { VirtualRam } from "./hw/vram.ts";
@@ -270,6 +271,13 @@ export interface BootClusterOptions {
 export interface BootedCluster {
   registry: WorkerRegistry;
   meshServer: Server;
+  /**
+   * The mesh handlers object the server was built from. createMeshServer
+   * reads it at request time, so the weights routes (which need the
+   * ModelRegistry, created only after boot) are attached to this same
+   * object by serveCluster once the registry exists — no second server.
+   */
+  meshHandlers: MeshServerHandlers;
   children: ChildProcess[];
   hypervisor: Hypervisor;
   vm: VirtualMachine;
@@ -287,12 +295,16 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
   const startedAt = Date.now();
 
   // --- Orchestrator: mesh registry + mesh server ---------------------------
+  // The handlers object is kept (and returned) so serveCluster can attach
+  // the vRAM weights routes to it once the ModelRegistry exists; the
+  // server reads handlers at request time, so late attachment works.
   const registry = new WorkerRegistry();
-  const meshServer = createMeshServer({
+  const meshHandlers: MeshServerHandlers = {
     register: (req) => registry.register(req.capability),
     heartbeat: (req) => registry.heartbeat(req),
     getAssignment: (workerId) => registry.getAssignment(workerId),
-  });
+  };
+  const meshServer = createMeshServer(meshHandlers);
   await new Promise<void>((resolve) => meshServer.listen(opts.port, "127.0.0.1", resolve));
   const orchestratorUrl = `http://127.0.0.1:${opts.port}`;
   console.log(`softwell: orchestrator mesh on ${orchestratorUrl}`);
@@ -364,7 +376,7 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
     };
   };
 
-  return { registry, meshServer, children, hypervisor, vm, servingState, getCluster };
+  return { registry, meshServer, meshHandlers, children, hypervisor, vm, servingState, getCluster };
 }
 
 /**
@@ -374,8 +386,10 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
  * modelDir onto every assignment, installs the plan, and builds a
  * ContinuousBatchingScheduler (MeshClient transport, sampleLogits,
  * tokenizer decode, engine decoding options) wrapped in the
- * InstrumentedScheduler. Workers load their own shards from the model
- * directory; the CLI never opens a weight loader itself.
+ * InstrumentedScheduler. Workers load their shards from pooled vRAM
+ * over the mesh weight endpoint (falling back to the model directory
+ * only before a model is staged); the CLI never opens a weight loader
+ * itself.
  */
 export function buildFactory(
   registry: WorkerRegistry,
@@ -553,9 +567,17 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
   const modelRegistry = new ModelRegistry({
     vm: () => vm,
     stageToVram: (key: string) => hypervisor.stageToVram(key),
+    readVram: (vaddr: number, length: number) => vm.ram.read(vaddr, length),
     isActive: (id: string) => server?.getActive()?.modelId === id,
     modelsDir: path.resolve("models"),
   });
+  // Attach the binary weight endpoint to the orchestrator's mesh server:
+  // workers fetch staged manifests + weight maps (JSON) and tensor bytes
+  // (octet-stream) from pooled vRAM through these handlers. The registry
+  // serves the bytes; no disk read happens on this path.
+  const weightHandlers = createWeightHandlers(modelRegistry);
+  cluster.meshHandlers.getWeightMap = weightHandlers.getWeightMap;
+  cluster.meshHandlers.getWeightTensor = weightHandlers.getWeightTensor;
   server = new VirtualServer({
     registry: modelRegistry,
     factory,

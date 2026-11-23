@@ -27,12 +27,17 @@ import * as path from "node:path";
 import type {
   EngineOptions,
   ModelEntry,
+  ModelManifest,
   VirtualMachine,
   VramAllocation,
+  VramWeightMap,
+  WeightMapResponse,
 } from "../contracts.ts";
 import { downloadModel, resolveModelRef } from "../model/hub.ts";
-import { loadManifest } from "../model/loader.ts";
+import { loadManifest, tensorFileFor } from "../model/loader.ts";
+import { safetensorsHeaderLength } from "../model/manifest.ts";
 import { BpeTokenizer, loadTokenizer } from "../model/tokenizer.ts";
+import { MeshError } from "../mesh/protocol.ts";
 
 /** KV-cache headroom reserved alongside the weights in the fit check. */
 export const KV_HEADROOM_BYTES = 512 * 1024 * 1024;
@@ -42,6 +47,13 @@ export interface RegistryDeps {
   vm: () => VirtualMachine | null;
   /** hypervisor.stageToVram: stage one vSSD object into vRAM. */
   stageToVram: (key: string) => Promise<VramAllocation>;
+  /**
+   * Read bytes from pooled vRAM (the orchestrator's path for serving
+   * weight bytes to workers). Defaults to `vm().ram.read` when omitted;
+   * the CLI passes `(vaddr, length) => vm.ram.read(vaddr, length)`
+   * explicitly so the serving path does not depend on the fallback.
+   */
+  readVram?: (vaddr: number, length: number) => Promise<Uint8Array>;
   /** Unload refuses the active model. */
   isActive: (modelId: string) => boolean;
   /** Directory scanned for locally available models. Default "./models". */
@@ -54,6 +66,13 @@ interface RegistryState {
   entries: Map<string, ModelEntry>;
   /** Model id -> vRAM allocation ids holding its staged weights. */
   allocIds: Map<string, string[]>;
+  /** Model id -> per-tensor vRAM locations (built at stage time). */
+  weightMaps: Map<string, VramWeightMap>;
+  /** Model id -> manifest read at load time (served to workers so they
+   *  can build a VramWeightLoader without touching disk). */
+  manifests: Map<string, ModelManifest>;
+  /** Raw weight bytes served to workers via readWeightTensor. */
+  weightBytesServed: number;
 }
 
 const states = new WeakMap<ModelRegistry, RegistryState>();
@@ -125,10 +144,14 @@ async function isKnownAvailable(state: RegistryState, id: string): Promise<boole
   return false;
 }
 
-/** Free every tracked vRAM allocation for a model (best effort). */
+/** Free every tracked vRAM allocation for a model (best effort). Also
+ *  drops the model's weight map and stored manifest: both describe
+ *  bytes that are no longer staged. */
 async function freeAllocations(state: RegistryState, id: string, vm: VirtualMachine): Promise<void> {
   const allocs = state.allocIds.get(id) ?? [];
   state.allocIds.delete(id);
+  state.weightMaps.delete(id);
+  state.manifests.delete(id);
   for (const allocId of allocs) {
     try {
       await vm.ram.free(allocId);
@@ -145,6 +168,9 @@ export class ModelRegistry {
       modelsDir: path.resolve(deps.modelsDir ?? "./models"),
       entries: new Map<string, ModelEntry>(),
       allocIds: new Map<string, string[]>(),
+      weightMaps: new Map<string, VramWeightMap>(),
+      manifests: new Map<string, ModelManifest>(),
+      weightBytesServed: 0,
     });
   }
 
@@ -212,6 +238,92 @@ export class ModelRegistry {
 
   get(id: string): ModelEntry | undefined {
     return stateOf(this).entries.get(id);
+  }
+
+  /**
+   * Per-tensor vRAM locations for a staged model (a copy; mutating it
+   * does not affect the registry). Undefined when the model is not
+   * staged — i.e. the orchestrator has no vRAM weights to serve for it
+   * and workers must fall back to the disk loader.
+   */
+  getWeightMap(modelId: string): VramWeightMap | undefined {
+    const map = stateOf(this).weightMaps.get(modelId);
+    if (map === undefined) return undefined;
+    const copy: VramWeightMap = {};
+    for (const [name, loc] of Object.entries(map)) {
+      copy[name] = {
+        allocId: loc.allocId,
+        vaddr: loc.vaddr,
+        headerLen: loc.headerLen,
+        dataOffsets: [loc.dataOffsets[0], loc.dataOffsets[1]],
+        dtype: loc.dtype,
+        shape: [...loc.shape],
+      };
+    }
+    return copy;
+  }
+
+  /** Manifest read at load time, or undefined when the model is not staged. */
+  getManifest(modelId: string): ModelManifest | undefined {
+    return stateOf(this).manifests.get(modelId);
+  }
+
+  /**
+   * Everything a worker needs to build a VramWeightLoader for a staged
+   * model, or null when the model is not staged. Served as JSON by
+   * GET /mesh/weights/map?model=<id>.
+   */
+  getWeightMapResponse(modelId: string): WeightMapResponse | null {
+    const state = stateOf(this);
+    const manifest = state.manifests.get(modelId);
+    const weightMap = this.getWeightMap(modelId);
+    if (manifest === undefined || weightMap === undefined) return null;
+    return { modelId, manifest, weightMap };
+  }
+
+  /** Raw weight bytes served to workers so far (orchestrator-side counter). */
+  get weightBytesServed(): number {
+    return stateOf(this).weightBytesServed;
+  }
+
+  /**
+   * Read one tensor's raw bytes from pooled vRAM (never from disk):
+   * the weight map locates the tensor inside its shard's staged bytes
+   * and the read goes through `deps.readVram` (or `vm().ram.read` when
+   * no readVram was supplied). Counts the bytes served. Throws a clear
+   * Error for an unstaged model or tensor; the mesh handler maps those
+   * to 404 (see createWeightHandlers).
+   */
+  async readWeightTensor(modelId: string, tensorName: string): Promise<Uint8Array> {
+    const state = stateOf(this);
+    const map = state.weightMaps.get(modelId);
+    if (map === undefined) {
+      throw new Error(`model "${modelId}" has no weights staged in vRAM`);
+    }
+    const loc = map[tensorName];
+    if (loc === undefined) {
+      throw new Error(`tensor "${tensorName}" is not staged in vRAM for model "${modelId}"`);
+    }
+    const start = loc.vaddr + loc.headerLen + loc.dataOffsets[0];
+    const length = loc.dataOffsets[1] - loc.dataOffsets[0];
+    const read = state.deps.readVram;
+    let bytes: Uint8Array;
+    if (read !== undefined) {
+      bytes = await read(start, length);
+    } else {
+      const vm = state.deps.vm();
+      if (vm === null) {
+        throw new Error(`cannot read vRAM for model "${modelId}": virtual machine is not booted`);
+      }
+      bytes = await vm.ram.read(start, length);
+    }
+    if (bytes.length !== length) {
+      throw new Error(
+        `vRAM read for tensor "${tensorName}" returned ${bytes.length} bytes, expected ${length}`,
+      );
+    }
+    state.weightBytesServed += bytes.length;
+    return bytes;
   }
 
   /**
@@ -293,20 +405,68 @@ export class ModelRegistry {
     }
 
     const staged: string[] = [];
+    const stagedAllocs: VramAllocation[] = [];
     try {
+      // Stage every file to vSSD. While the shard bytes are in hand,
+      // record each shard's safetensors header length — the weight map
+      // needs it to locate tensors inside the raw staged bytes, and
+      // reading it here (ingest, from disk) is the only disk read the
+      // weight path ever does.
+      const headerLens = new Map<string, number>();
       for (const rel of listFilesRecursive(dir)) {
         const data = fs.readFileSync(path.join(dir, rel));
         await vm.ssd.putObject(`models/${id}/${rel}`, data);
+        if (rel.endsWith(".safetensors")) {
+          const headerLen = safetensorsHeaderLength(data);
+          headerLens.set(rel, headerLen);
+          headerLens.set(path.basename(rel), headerLen);
+        }
       }
       let totalStaged = 0;
       for (const file of manifest.files) {
         const alloc = await state.deps.stageToVram(`models/${id}/${file.filename}`);
         staged.push(alloc.id);
+        stagedAllocs.push(alloc);
         totalStaged += alloc.sizeBytes;
         if (entry.weightVaddr === undefined) entry.weightVaddr = alloc.vaddr;
       }
       entry.vramBytes = totalStaged;
       state.allocIds.set(id, staged);
+      // Per-tensor weight map: shard alloc vaddr + header length + the
+      // tensor's dataOffsets from the manifest. Staged bytes are the raw
+      // shard file bytes, so tensor bytes live at
+      // vaddr + headerLen + dataOffsets[0].
+      const allocByFile = new Map<string, VramAllocation>();
+      for (let i = 0; i < manifest.files.length; i++) {
+        const file = manifest.files[i] as { filename: string };
+        allocByFile.set(file.filename, stagedAllocs[i] as VramAllocation);
+      }
+      const weightMap: VramWeightMap = {};
+      for (const [name, meta] of Object.entries(manifest.tensors)) {
+        const shard =
+          tensorFileFor(manifest, name) ??
+          (manifest.files.length === 1
+            ? (manifest.files[0] as { filename: string }).filename
+            : undefined);
+        if (shard === undefined) {
+          throw new Error(`tensor "${name}" has no shard file in the manifest`);
+        }
+        const alloc = allocByFile.get(shard);
+        const headerLen = headerLens.get(shard);
+        if (alloc === undefined || headerLen === undefined) {
+          throw new Error(`shard "${shard}" was not staged to vRAM`);
+        }
+        weightMap[name] = {
+          allocId: alloc.id,
+          vaddr: alloc.vaddr,
+          headerLen,
+          dataOffsets: [meta.dataOffsets[0], meta.dataOffsets[1]],
+          dtype: meta.dtype,
+          shape: [...meta.shape],
+        };
+      }
+      state.weightMaps.set(id, weightMap);
+      state.manifests.set(id, manifest);
     } catch (err) {
       for (const allocId of staged) {
         try {
@@ -316,6 +476,8 @@ export class ModelRegistry {
         }
       }
       state.allocIds.delete(id);
+      state.weightMaps.delete(id);
+      state.manifests.delete(id);
       entry.status = "error";
       entry.error = err instanceof Error ? err.message : String(err);
       entry.vramBytes = 0;
@@ -368,4 +530,37 @@ export class ModelRegistry {
     entry.weightVaddr = undefined;
     console.log(`softwell: model ${id} unloaded`);
   }
+}
+
+/**
+ * Mesh handlers for the orchestrator's binary weight endpoint, backed by
+ * one registry. This is the single shared construction used by the CLI
+ * wiring (src/cli.ts) and the endpoint tests, so the tested path is the
+ * shipped path:
+ *   getWeightMap    -> GET /mesh/weights/map?model=<id> (JSON)
+ *   getWeightTensor -> GET /mesh/weights?model=<id>&tensor=<name> (bytes)
+ * Unknown model / unstaged tensor -> MeshError 404 (the protocol layer
+ * renders it as JSON { error }); the byte path never reads disk.
+ */
+export function createWeightHandlers(registry: ModelRegistry): {
+  getWeightMap: (modelId: string) => WeightMapResponse | null;
+  getWeightTensor: (modelId: string, tensorName: string) => Promise<Uint8Array>;
+} {
+  return {
+    getWeightMap: (modelId: string) => registry.getWeightMapResponse(modelId),
+    getWeightTensor: async (modelId: string, tensorName: string) => {
+      const map = registry.getWeightMap(modelId);
+      if (map === undefined) {
+        throw new MeshError(`unknown model or model not staged in vRAM: ${modelId}`, {
+          status: 404,
+        });
+      }
+      if (!(tensorName in map)) {
+        throw new MeshError(`tensor not staged in vRAM for model ${modelId}: ${tensorName}`, {
+          status: 404,
+        });
+      }
+      return registry.readWeightTensor(modelId, tensorName);
+    },
+  };
 }

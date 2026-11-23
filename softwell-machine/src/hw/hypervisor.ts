@@ -229,12 +229,24 @@ export class Hypervisor {
       throw new Error(`stageToVram: object not found in vSSD: ${key}`);
     }
     const alloc = await this.opts.ram.alloc(meta.sizeBytes);
-    let offset = 0;
-    while (offset < meta.sizeBytes) {
-      const length = Math.min(VRAM_PAGE_SIZE_BYTES, meta.sizeBytes - offset);
-      const chunk = await this.opts.ssd.getRange(key, offset, length);
-      await this.opts.ram.write(alloc.vaddr + offset, chunk);
-      offset += length;
+    try {
+      let offset = 0;
+      while (offset < meta.sizeBytes) {
+        const length = Math.min(VRAM_PAGE_SIZE_BYTES, meta.sizeBytes - offset);
+        const chunk = await this.opts.ssd.getRange(key, offset, length);
+        await this.opts.ram.write(alloc.vaddr + offset, chunk);
+        offset += length;
+      }
+    } catch (err) {
+      // A failed stage must not leak the allocation: free it (best
+      // effort — the donors may already be dead) and rethrow.
+      try {
+        await this.opts.ram.free(alloc.id);
+      } catch {
+        // Best effort only: the allocation is dropped from the page
+        // table regardless of whether the donors answer.
+      }
+      throw err;
     }
     return alloc;
   }

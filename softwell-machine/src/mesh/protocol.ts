@@ -9,6 +9,7 @@ import type {
   HeartbeatResponse,
   RegisterRequest,
   RegisterResponse,
+  WeightMapResponse,
   WorkerCapability,
 } from "../contracts.ts";
 
@@ -59,6 +60,22 @@ export interface MeshServerHandlers {
   ) => AssignmentResponse | Promise<AssignmentResponse>;
   /** If absent, POST /mesh/execute answers 404 (e.g. the orchestrator). */
   execute?: ExecuteHandler;
+  /**
+   * Binary weight serving (orchestrator only). getWeightMap answers
+   * GET /mesh/weights/map?model=<id> with the manifest + per-tensor
+   * vRAM locations, or null when the model is not staged (404).
+   * getWeightTensor answers GET /mesh/weights?model=<id>&tensor=<name>
+   * with exactly that tensor's raw bytes as application/octet-stream;
+   * it throws MeshError 404 for an unknown model/tensor and must never
+   * read disk — bytes come from pooled vRAM via the registry.
+   */
+  getWeightMap?: (
+    modelId: string,
+  ) => WeightMapResponse | null | Promise<WeightMapResponse | null>;
+  getWeightTensor?: (
+    modelId: string,
+    tensorName: string,
+  ) => Promise<Uint8Array>;
 }
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
@@ -96,6 +113,14 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
+function sendOctet(res: ServerResponse, bytes: Uint8Array): void {
+  res.writeHead(200, {
+    "content-type": "application/octet-stream",
+    "content-length": bytes.byteLength,
+  });
+  res.end(bytes);
+}
+
 function normalizePath(pathname: string): string {
   if (pathname.length > 1 && pathname.endsWith("/")) {
     return pathname.slice(0, -1);
@@ -109,6 +134,8 @@ function normalizePath(pathname: string): string {
  *   POST /mesh/heartbeat
  *   GET  /mesh/assignment?workerId=...
  *   POST /mesh/execute
+ *   GET  /mesh/weights/map?model=...        (manifest + vRAM weight map, JSON)
+ *   GET  /mesh/weights?model=...&tensor=... (one tensor's raw bytes, octet-stream)
  * The caller owns listen()/close(). Unknown routes answer 404, a known
  * route with the wrong method answers 405, a route whose handler was not
  * supplied answers 404.
@@ -137,9 +164,50 @@ async function handleRequest(
   const path = normalizePath(url.pathname);
   const method = req.method ?? "GET";
 
-  const knownPaths = ["/mesh/register", "/mesh/heartbeat", "/mesh/assignment", "/mesh/execute"];
+  const knownPaths = [
+    "/mesh/register",
+    "/mesh/heartbeat",
+    "/mesh/assignment",
+    "/mesh/execute",
+    "/mesh/weights",
+    "/mesh/weights/map",
+  ];
   if (!knownPaths.includes(path)) {
     sendJson(res, 404, { error: `unknown route: ${method} ${path}` });
+    return;
+  }
+
+  if (path === "/mesh/weights/map") {
+    if (method !== "GET") return sendJson(res, 405, { error: "method not allowed" });
+    if (handlers.getWeightMap === undefined) {
+      return sendJson(res, 404, { error: "weights map not available on this server" });
+    }
+    const modelId = url.searchParams.get("model");
+    if (modelId === null || modelId === "") {
+      return sendJson(res, 400, { error: "missing query parameter: model" });
+    }
+    const result = await handlers.getWeightMap(modelId);
+    if (result === null) {
+      return sendJson(res, 404, { error: `unknown model or model not staged in vRAM: ${modelId}` });
+    }
+    sendJson(res, 200, result);
+    return;
+  }
+
+  if (path === "/mesh/weights") {
+    if (method !== "GET") return sendJson(res, 405, { error: "method not allowed" });
+    if (handlers.getWeightTensor === undefined) {
+      return sendJson(res, 404, { error: "weights not available on this server" });
+    }
+    const modelId = url.searchParams.get("model");
+    const tensorName = url.searchParams.get("tensor");
+    if (modelId === null || modelId === "") {
+      return sendJson(res, 400, { error: "missing query parameter: model" });
+    }
+    if (tensorName === null || tensorName === "") {
+      return sendJson(res, 400, { error: "missing query parameter: tensor" });
+    }
+    sendOctet(res, await handlers.getWeightTensor(modelId, tensorName));
     return;
   }
 
@@ -277,6 +345,83 @@ export class MeshClient {
   ): Promise<AssignmentResponse> {
     const url = `${joinUrl(orchestratorUrl, "/mesh/assignment")}?workerId=${encodeURIComponent(workerId)}`;
     return this.request<AssignmentResponse>(url, { method: "GET" });
+  }
+
+  /**
+   * Raw fetch with the same timeout/connection error mapping as
+   * request(), but returning the Response so callers can handle binary
+   * bodies and 404s themselves.
+   */
+  private async fetchRaw(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === "TimeoutError") {
+        throw new MeshError(`mesh request timed out after ${this.timeoutMs}ms: ${url}`, {
+          code: "TIMEOUT",
+          cause: err,
+        });
+      }
+      throw new MeshError(`mesh request failed: ${url}`, {
+        code: "CONNECTION_ERROR",
+        cause: err,
+      });
+    }
+  }
+
+  /** Turn a non-2xx response into a MeshError, preferring its JSON error. */
+  private async errorFromResponse(res: Response, url: string): Promise<MeshError> {
+    let detail = "";
+    try {
+      const body = (await res.json()) as { error?: unknown };
+      if (typeof body.error === "string") detail = `: ${body.error}`;
+    } catch {
+      // Non-JSON error body; keep the status text only.
+    }
+    return new MeshError(`mesh request failed with HTTP ${res.status}${detail}`, {
+      status: res.status,
+      code: "HTTP_ERROR",
+    });
+  }
+
+  /**
+   * Fetch the manifest + vRAM weight map for a staged model
+   * (GET /mesh/weights/map?model=<id>). Returns null when the
+   * orchestrator has not staged the model (HTTP 404) — the worker
+   * treats that as "fall back to the disk loader". Any other failure
+   * throws MeshError.
+   */
+  async getWeightMap(
+    orchestratorUrl: string,
+    modelId: string,
+  ): Promise<WeightMapResponse | null> {
+    const url = `${joinUrl(orchestratorUrl, "/mesh/weights/map")}?model=${encodeURIComponent(modelId)}`;
+    const res = await this.fetchRaw(url, { method: "GET" });
+    if (res.status === 404) return null;
+    if (!res.ok) throw await this.errorFromResponse(res, url);
+    return (await res.json()) as WeightMapResponse;
+  }
+
+  /**
+   * Fetch one tensor's raw bytes from pooled vRAM
+   * (GET /mesh/weights?model=<id>&tensor=<name>), as octet-stream —
+   * never JSON/base64. Throws MeshError (with status 404 for an
+   * unknown model/tensor).
+   */
+  async fetchWeightTensor(
+    orchestratorUrl: string,
+    modelId: string,
+    tensorName: string,
+  ): Promise<Uint8Array> {
+    const url =
+      `${joinUrl(orchestratorUrl, "/mesh/weights")}` +
+      `?model=${encodeURIComponent(modelId)}&tensor=${encodeURIComponent(tensorName)}`;
+    const res = await this.fetchRaw(url, { method: "GET" });
+    if (!res.ok) throw await this.errorFromResponse(res, url);
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   async execute(workerUrl: string, req: ExecuteRequest): Promise<ExecuteResponse> {
