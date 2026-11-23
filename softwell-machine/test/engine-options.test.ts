@@ -183,7 +183,7 @@ async function prefillLogits(
     loader.manifest.config.headDim,
   );
   const embedded = executor.embed(prompt);
-  const out = executor.forward(embedded, {
+  const out = await executor.forward(embedded, {
     seqIds: prompt.map(() => "t"),
     positions: prompt.map((_, i) => i),
     isPrefill: true,
@@ -267,7 +267,7 @@ async function decodeLogits(options: EngineOptions, prompt: number[], steps: num
   );
   const vocab = loader.manifest.config.vocabSize;
   const embedded = executor.embed(prompt);
-  let out = executor.forward(embedded, {
+  let out = await executor.forward(embedded, {
     seqIds: prompt.map(() => "t"),
     positions: prompt.map((_, i) => i),
     isPrefill: true,
@@ -280,7 +280,7 @@ async function decodeLogits(options: EngineOptions, prompt: number[], steps: num
     for (let i = 1; i < vocab; i++) if (pending[i] > pending[best]) best = i;
     const tok = best;
     const emb = executor.embed([tok]);
-    out = executor.forward(emb, {
+    out = await executor.forward(emb, {
       seqIds: ["t"],
       positions: [prompt.length + s],
       isPrefill: false,

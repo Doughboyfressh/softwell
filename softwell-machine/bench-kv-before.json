@@ -1,0 +1,231 @@
+{
+  "label": "before",
+  "date": "2026-11-23T02:17:20.112Z",
+  "model": "demo-100m",
+  "params": 104365056,
+  "workers": 1,
+  "mesh_port": 18512,
+  "api_port": 18522,
+  "kv_cache": "host BlockPagedKVCache (block size 16) — vRAM cache NOT wired in",
+  "max_tokens": 8,
+  "temperature": 0,
+  "host": {
+    "node": "v24.22.1",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 4,
+    "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+    "total_mem_mib": 7934,
+    "free_mem_mib": 4032,
+    "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        3902        3191          38        1143        4032\nSwap:           1023         429         594",
+    "loadavg": [
+      1.67,
+      5.37,
+      3.71
+    ]
+  },
+  "conditions": {
+    "short": {
+      "prompt": "Hello world",
+      "prompt_construction": {
+        "content": "Hello world",
+        "expected_prompt_tokens": 18
+      },
+      "prompt_tokens_measured": 18,
+      "prompt_tokens_probe_error": null,
+      "host_before_condition": {
+        "node": "v24.22.1",
+        "platform": "linux",
+        "arch": "x64",
+        "cpus": 4,
+        "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+        "total_mem_mib": 7934,
+        "free_mem_mib": 3149,
+        "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        4785        2838          33         591        3148\nSwap:           1023         430         593",
+        "loadavg": [
+          0.78,
+          4.16,
+          3.42
+        ]
+      },
+      "runs": [
+        {
+          "rep": 1,
+          "ttft_ms": 6698,
+          "decode_tok_per_s": 3.07,
+          "total_ms": 9305,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        },
+        {
+          "rep": 2,
+          "ttft_ms": 6207,
+          "decode_tok_per_s": 3.95,
+          "total_ms": 8230,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        },
+        {
+          "rep": 3,
+          "ttft_ms": 3645,
+          "decode_tok_per_s": 5.76,
+          "total_ms": 5035,
+          "content_tokens": 8,
+          "data_events": 9,
+          "content": "CCCCCCCC"
+        }
+      ],
+      "summary": {
+        "median_ttft_ms": 6207,
+        "ttft_ms_range": [
+          3645,
+          6698
+        ],
+        "median_decode_tok_per_s": 3.95,
+        "decode_tok_per_s_range": [
+          3.07,
+          5.76
+        ],
+        "median_total_ms": 8230,
+        "total_ms_range": [
+          5035,
+          9305
+        ],
+        "successful_runs": 3,
+        "failed_runs": 0
+      }
+    },
+    "long": {
+      "prompt_construction": {
+        "sentence": "The quick brown fox jumps over the lazy dog. ",
+        "repeats": 22,
+        "content_chars": 990,
+        "content_bytes": 990,
+        "expected_prompt_tokens": 997
+      },
+      "prompt_tokens_measured": 997,
+      "prompt_tokens_probe_error": null,
+      "host_before_condition": {
+        "node": "v24.22.1",
+        "platform": "linux",
+        "arch": "x64",
+        "cpus": 4,
+        "cpu_model": "AMD EPYC 9D25 126-Core Processor",
+        "total_mem_mib": 7934,
+        "free_mem_mib": 2717,
+        "free_m_output": "total        used        free      shared  buff/cache   available\nMem:            7934        5217        2204          43         803        2716\nSwap:           1023         416         607",
+        "loadavg": [
+          1.19,
+          3.2,
+          3.16
+        ]
+      },
+      "runs": [
+        {
+          "rep": 1,
+          "error": "stream incomplete (contentChunks=0, done=true)"
+        },
+        {
+          "rep": 2,
+          "error": "stream incomplete (contentChunks=0, done=true)"
+        },
+        {
+          "rep": 3,
+          "error": "stream incomplete (contentChunks=0, done=true)"
+        }
+      ],
+      "summary": {
+        "median_ttft_ms": null,
+        "ttft_ms_range": null,
+        "median_decode_tok_per_s": null,
+        "decode_tok_per_s_range": null,
+        "median_total_ms": null,
+        "total_ms_range": null,
+        "successful_runs": 0,
+        "failed_runs": 3
+      }
+    }
+  },
+  "server_status": {
+    "state": "ready",
+    "uptimeSec": 0.417,
+    "activeModelId": "demo-100m",
+    "models": [
+      {
+        "id": "demo-100m",
+        "source": {
+          "kind": "local",
+          "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m"
+        },
+        "dir": "/home/hatch/workspace/softwell-machine/demo/models/demo-100m",
+        "status": "ready",
+        "vramBytes": 417473018,
+        "requestsServed": 0,
+        "tokensGenerated": 0,
+        "params": 104365056,
+        "weightBytes": 417460224,
+        "numLayers": 12,
+        "architectures": [
+          "LlamaForCausalLM"
+        ],
+        "tokenizerKind": "byte-level",
+        "weightVaddr": 0,
+        "loadedAt": 1795400291480
+      }
+    ],
+    "requests": {
+      "active": 0,
+      "queued": 0,
+      "completed": 0,
+      "rejected": 0,
+      "cancelled": 0
+    },
+    "tokensPerSec": 0,
+    "queueDepth": 0,
+    "vm": {
+      "vram": {
+        "totalBytes": 8589934592,
+        "usedBytes": 1107296256,
+        "freeBytes": 7482638336,
+        "pages": 264,
+        "nodes": 1
+      },
+      "gpu": {
+        "devices": [
+          {
+            "nodeId": "worker-mwsmybhb-73hgkleh",
+            "device": "cpu",
+            "flopsPerSec": 1117707094.0894692
+          }
+        ],
+        "totalFlopsPerSec": 1117707094.0894692,
+        "kernelsCompleted": 0,
+        "kernelsFailed": 0
+      },
+      "cpu": {
+        "nodes": 1,
+        "totalCores": 4,
+        "queued": 0,
+        "completed": 0,
+        "failed": 0,
+        "nodesReportingCores": 1,
+        "nodesAssumedCores": 0
+      },
+      "ssd": {
+        "objects": 6,
+        "totalBytes": 457224554,
+        "nodes": 1
+      },
+      "nodes": [
+        {
+          "nodeId": "worker-mwsmybhb-73hgkleh",
+          "device": "cpu",
+          "state": "healthy"
+        }
+      ]
+    },
+    "recentRequests": []
+  }
+}

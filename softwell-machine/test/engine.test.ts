@@ -134,16 +134,16 @@ class StubCache implements PagedKVCache {
   readonly blockSize = 16;
   private store = new Map<string, { position: number; key: Float32Array; value: Float32Array }[]>();
 
-  allocate(_seqId: string, _layer: number, _numTokens: number): number[] {
+  async allocate(_seqId: string, _layer: number, _numTokens: number): Promise<number[]> {
     return [0];
   }
-  append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): void {
+  async append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): Promise<void> {
     const k = `${seqId}:${layer}`;
     const entries = this.store.get(k) ?? [];
     entries.push({ position, key: Float32Array.from(key), value: Float32Array.from(value) });
     this.store.set(k, entries);
   }
-  read(seqId: string, layer: number, positions: number[]): { keys: Float32Array; values: Float32Array } {
+  async read(seqId: string, layer: number, positions: number[]): Promise<{ keys: Float32Array; values: Float32Array }> {
     const entries = this.store.get(`${seqId}:${layer}`) ?? [];
     const headDim = entries.length > 0 ? entries[0].key.length : 0;
     const keys = new Float32Array(positions.length * headDim);
@@ -156,10 +156,13 @@ class StubCache implements PagedKVCache {
     }
     return { keys, values };
   }
-  free(seqId: string): void {
+  async free(seqId: string): Promise<void> {
     for (const k of [...this.store.keys()]) {
       if (k.startsWith(`${seqId}:`)) this.store.delete(k);
     }
+  }
+  async close(): Promise<void> {
+    this.store.clear();
   }
   usedBlocks(): number {
     return 0;
@@ -312,14 +315,14 @@ const prefillCtx: ForwardContext = {
 };
 
 const t0 = performance.now();
-const logits = executor.forward(embedded, prefillCtx);
+const logits = await executor.forward(embedded, prefillCtx);
 const prefillMs = performance.now() - t0;
 assert.deepEqual(logits.shape, [4, VOCAB], "prefill logits shape");
 assertFinite(logits.data, "prefill logits");
 console.log(`ok prefill forward: shape [4, ${VOCAB}], ${(prefillMs / 4).toFixed(2)} ms/token`);
 
 // Determinism: same weights + fresh cache => bitwise-identical logits.
-const logits2 = executor.forward(embedded, {
+const logits2 = await executor.forward(embedded, {
   seqIds: ["s1", "s1", "s1", "s1"],
   positions: [0, 1, 2, 3],
   isPrefill: true,
@@ -339,7 +342,7 @@ for (let step = 0; step < 5; step++) {
   generated.push(tok);
   const emb = executor.embed([tok]);
   const d0 = performance.now();
-  const out = executor.forward(emb, {
+  const out = await executor.forward(emb, {
     seqIds: ["s1"],
     positions: [4 + step],
     isPrefill: false,
@@ -356,7 +359,7 @@ console.log(`decode latency: ${(decodeMsTotal / 5).toFixed(2)} ms/token`);
 // Batched rows for two sequences in one forward (grouped per sequence).
 const cacheB = new StubCache();
 const emb2 = executor.embed([1, 2]);
-const out2 = executor.forward(emb2, {
+const out2 = await executor.forward(emb2, {
   seqIds: ["a", "b"],
   positions: [0, 0],
   isPrefill: true,

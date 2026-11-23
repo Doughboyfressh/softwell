@@ -4,9 +4,12 @@
  * One scheduler lives on the orchestrator. Each step():
  *   1. admits waiting sequences (FIFO) while the running count is below
  *      maxSequences and the step's token budget (maxBatchTokens) fits;
- *   2. runs PREFILL for newly admitted sequences — one batched forward per
- *      pipeline stage, chaining hidden states stage 0 -> ... -> N-1, and
- *      samples the first token from the last stage's logits;
+ *   2. runs PREFILL for newly admitted sequences — the prompt is split
+ *      into 16-row chunks (PREFILL_CHUNK_ROWS), each chunk one batched
+ *      forward per pipeline stage, chaining hidden states stage 0 ->
+ *      ... -> N-1, and samples the first token from the last chunk's
+ *      logits (the last row of the last chunk is the prompt's last
+ *      token);
  *   3. runs one DECODE token for every already-running sequence through the
  *      same stage chain, and samples the next token.
  *
@@ -42,6 +45,13 @@ import type {
 } from "../contracts.ts";
 import { argmax } from "../engine/sampling.ts";
 import { NGramDrafter } from "../engine/novel-decoding.ts";
+
+/**
+ * Rows per prefill chunk (runStageChain). See the chunked-prefill comment
+ * there: 16 rows ≈ 4 s per stage-chain execute at ctx ~1000 on this host,
+ * comfortably inside the server transport's 30 s mesh timeout.
+ */
+const PREFILL_CHUNK_ROWS = 16;
 
 /** Transport injected by the coordinator: one execute call to one worker. */
 export type SchedulerTransport = (
@@ -317,18 +327,22 @@ export class ContinuousBatchingScheduler implements Scheduler {
         info.prefillRoutes = routes;
         try {
           const logits = await this.runStageChain(toPrefill, "prefill", routes);
-          // Logits rows are in the same order as the batched rows; each
-          // sequence's last prompt token is its sampling position.
+          // runStageChain returns one row per sequence (in toPrefill
+          // order): the logits for each sequence's last prompt token.
+          // (Decode does the same — one row per sequence — so the two
+          // call sites read rows the same way.)
           let row = 0;
           for (const record of toPrefill) {
-            const promptLen = record.state.promptTokenIds.length;
-            const lastRow = row + promptLen - 1;
-            row += promptLen;
+            // The row index advances for every record, including one
+            // cancelled mid-prefill: runStageChain returns one row per
+            // record, so skipping the increment would misalign the rest.
+            const thisRow = row;
+            row += 1;
             // A sequence cancelled while its prefill forward was in
             // flight must not be resurrected: discard its logits.
             if (record.state.status !== "prefill") continue;
             const vocab = logits.shape[1] as number;
-            const rowLogits = new Float32Array(logits.data.slice(lastRow * vocab, (lastRow + 1) * vocab));
+            const rowLogits = new Float32Array(logits.data.slice(thisRow * vocab, (thisRow + 1) * vocab));
             const tokenId = this.sampler(rowLogits, record.request.sampling);
             record.state.status = "decoding";
             record.state.prefillDoneAt = Date.now();
@@ -458,8 +472,11 @@ export class ContinuousBatchingScheduler implements Scheduler {
 
   /**
    * Run one batched forward through every pipeline stage in order.
-   * Returns the last stage's output (logits). `records` are the sequences
-   * in this batch, in row order.
+   * Returns one logits row per record, in record order: for decode,
+   * each record's single row; for prefill, each record's last-prompt-
+   * token row (prefill is chunked internally — see below — so the
+   * returned rows are assembled from the chunks that held them).
+   * `records` are the sequences in this batch, in row order.
    */
   private async runStageChain(
     records: SequenceRecord[],
@@ -491,10 +508,62 @@ export class ContinuousBatchingScheduler implements Scheduler {
         });
       }
     }
+    // Chunked prefill: a long prompt must not go out as one mesh execute.
+    // A 997-token prefill on this host takes ~224 s (bench-kv-before,
+    // in-process supplement) while the server's scheduler transport uses
+    // a MeshClient with a 30 s timeout (src/cli.ts buildFactory) — so a
+    // single execute always timed out, the scheduler marked the sequence
+    // "error", and the worker kept grinding the orphaned prefill for
+    // minutes. Each chunk is one stage-chain execute with absolute
+    // positions preserved; the engine treats chunks after the first as a
+    // continued prefill (its per-row fallback path), so chunking changes
+    // timing, not numerics. The returned tensor has ONE row per record
+    // (in record order) — the logits for that record's last prompt
+    // token, lifted out of whichever chunk contained it — never the
+    // last chunk's rows, which would lose every sequence whose last
+    // token fell in an earlier chunk. Sizing: ~0.22 s/row at ctx ~1000
+    // on this host, so 16 rows ≈ 4 s per chunk (~7x headroom under the
+    // 30 s timeout, ~2x under load noise). A 4k prompt's late rows cost
+    // ~2x more per row, so 4k is near the edge of this size — a
+    // longer-context follow-up should re-measure before raising it.
+    // Decode rows are single tokens and never chunked.
+    if (kind === "prefill") {
+      // Per-record row ranges in the flattened rows array.
+      const ranges: Array<{ start: number; len: number }> = [];
+      let cursor = 0;
+      for (const record of records) {
+        const len = record.state.promptTokenIds.length;
+        ranges.push({ start: cursor, len });
+        cursor += len;
+      }
+      const lastRows: Array<number[] | undefined> = records.map(() => undefined);
+      let vocab: number | null = null;
+      for (let start = 0; start < rows.length; start += PREFILL_CHUNK_ROWS) {
+        const chunk = rows.slice(start, start + PREFILL_CHUNK_ROWS);
+        const output = await this.runRows(chunk, kind, routes);
+        if (vocab === null) vocab = output.shape[1] as number;
+        for (let i = 0; i < ranges.length; i++) {
+          if (lastRows[i] !== undefined) continue;
+          const range = ranges[i] as { start: number; len: number };
+          const lastRow = range.start + range.len - 1;
+          if (lastRow >= start && lastRow < start + chunk.length) {
+            const rowInChunk = lastRow - start;
+            lastRows[i] = output.data.slice(
+              rowInChunk * (vocab as number),
+              (rowInChunk + 1) * (vocab as number),
+            );
+          }
+        }
+      }
+      // Every record's last row is in exactly one chunk, so all rows are
+      // captured; rows is non-empty here (step() only prefills sequences
+      // with a non-empty prompt), so vocab is always set.
+      const data: number[] = [];
+      for (const row of lastRows) data.push(...(row as number[]));
+      return { data, shape: [records.length, vocab as number] };
+    }
     return this.runRows(rows, kind, routes);
   }
-
-  /** Tokens a sequence may still generate (maxTokens minus generated). */
   private remainingTokens(record: SequenceRecord): number {
     return record.request.sampling.maxTokens - record.state.generatedTokenIds.length;
   }

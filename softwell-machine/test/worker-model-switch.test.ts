@@ -61,10 +61,11 @@ const DEMO_MODEL_A_DIR = fileURLToPath(
 function makeCache(): PagedKVCache {
   return {
     blockSize: 16,
-    allocate: () => [],
-    append: () => {},
-    read: () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
-    free: () => {},
+    allocate: async () => [],
+    append: async () => {},
+    read: async () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
+    free: async () => {},
+    close: async () => {},
     usedBlocks: () => 0,
     totalBlocks: () => 0,
   };
@@ -117,6 +118,14 @@ async function main(): Promise<void> {
   const builtFromManifests: string[] = [];
   const loadedLoaders: WeightLoader[] = [];
   const cacheManifests: string[] = [];
+  // Which model's stage actually served each forward: the only
+  // observable that distinguishes "old stage kept" from "new stage
+  // installed", since the executor is built+loaded before createCache
+  // runs (a cache failure discards it, never installs it).
+  const forwardServed: string[] = [];
+  // (5b) flips this to make createCache reject, simulating the vRAM
+  // probe failing (vRAM unreachable) — the old stage must keep serving.
+  let failCache = false;
   const backend: EngineBackend = {
     name: "fake-recording",
     createStageExecutor(manifest: ModelManifest, assignment: ShardAssignment): StageExecutor {
@@ -130,7 +139,10 @@ async function main(): Promise<void> {
           data: new Float32Array(tokenIds.length * 2),
           shape: [tokenIds.length, 2],
         }),
-        forward: (input: Tensor, _ctx: ForwardContext): Tensor => input,
+        forward: async (input: Tensor, _ctx: ForwardContext): Promise<Tensor> => {
+          forwardServed.push(manifest.modelId);
+          return input;
+        },
         memoryBytes: () => 4096,
       };
     },
@@ -166,6 +178,7 @@ async function main(): Promise<void> {
       loader: spawnLoader,
       createCache: (manifest: ModelManifest) => {
         cacheManifests.push(manifest.modelId);
+        if (failCache) throw new Error("simulated vRAM probe failure: alloc rejected");
         return makeCache();
       },
       pollIntervalMs: 50,
@@ -263,12 +276,58 @@ async function main(): Promise<void> {
     // and the execute above would have failed on a dead worker).
     console.log("nonexistent model dir does not crash the worker; old stage keeps serving: ok");
 
-    // --- (6) Recovery: a good assignment after the bad one loads again. ---
+    // --- (5b) A rejecting cache factory (the vRAM probe failing, P5):
+    // no crash, the old stage keeps serving, and a later good
+    // assignment loads again. The CLI's vRAM factory probes the access
+    // (one alloc + free) and rejects when vRAM is unreachable; the
+    // worker must treat that like any other stage-load failure — keep
+    // the previous stage, retry on the next poll — never fall back to
+    // a host cache and never drop the stage. Note the executor IS built
+    // and loaded before createCache runs, so builtFromManifests records
+    // model B here; the proof the old stage kept serving is that the
+    // forward after the failure is still served by model A's stage. ---
+    failCache = true;
     orchState.assignment = makeAssignment(workerId, {
       modelId: modelBId,
       modelDir: modelBDir,
     });
     orchState.version = 6;
+    await sleep(400);
+    await execute();
+    assert.equal(
+      forwardServed.at(-1),
+      "demo-10m",
+      "rejecting cache factory must keep the old stage serving",
+    );
+    failCache = false;
+    orchState.version = 7;
+    // The failed attempts already built model B executors, so
+    // builtFromManifests cannot tell us the stage installed — poll
+    // execute() until a forward is served by model B's stage.
+    {
+      const deadline = Date.now() + 5000;
+      for (;;) {
+        await execute();
+        if (forwardServed.at(-1) === modelBId) break;
+        if (Date.now() > deadline) {
+          throw new Error("timed out waiting for: recovery load of model B after cache failure");
+        }
+        await sleep(50);
+      }
+    }
+    assert.equal(
+      forwardServed.at(-1),
+      modelBId,
+      "recovery assignment must install model B's stage",
+    );
+    console.log("rejecting cache factory keeps the old stage serving; recovery loads: ok");
+
+    // --- (6) Recovery: a good assignment after the bad one loads again. ---
+    orchState.assignment = makeAssignment(workerId, {
+      modelId: modelBId,
+      modelDir: modelBDir,
+    });
+    orchState.version = 8;
     await waitFor(() => builtFromManifests.at(-1) === modelBId, "recovery load of model B");
     await execute();
     console.log("worker recovers with a good assignment after a bad one: ok");

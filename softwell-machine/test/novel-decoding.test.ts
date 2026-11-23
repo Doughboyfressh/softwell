@@ -143,7 +143,7 @@ class FakeExecutor implements StageExecutor {
     for (let r = 0; r < tokenIds.length; r++) data[r * 4] = tokenIds[r] as number;
     return { data, shape: [tokenIds.length, 4] };
   }
-  forward(input: Tensor, ctx: ForwardContext): Tensor {
+  async forward(input: Tensor, ctx: ForwardContext): Promise<Tensor> {
     const rows = input.shape[0];
     const logits = new Float32Array(rows * FAKE_VOCAB);
     for (let r = 0; r < rows; r++) {
@@ -181,7 +181,7 @@ const fakePrompt = [1, 3];
 
 {
   const fake = new FakeExecutor(fakeAssignment);
-  const base = new AutoregressiveDecoder({
+  const base = await new AutoregressiveDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "base",
@@ -215,7 +215,7 @@ class FixedDrafter implements Drafter {
 {
   const fake = new FakeExecutor(fakeAssignment);
   // Empty draft: must fall back to plain autoregressive steps, exactly.
-  const spec = new SpeculativeDecoder({
+  const spec = await new SpeculativeDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "spec-empty",
@@ -232,7 +232,7 @@ class FixedDrafter implements Drafter {
   console.log("ok edge case: empty draft falls back to plain decoding, token-identical");
 
   // Draft longer than remaining maxTokens (K=8, maxTokens=3): exact, no overrun.
-  const specLong = new SpeculativeDecoder({
+  const specLong = await new SpeculativeDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "spec-long",
@@ -248,7 +248,7 @@ class FixedDrafter implements Drafter {
   // EOS mid-draft: drafter proposes [12, 1, EOS, 9]; the EOS is accepted
   // as the third draft token and generation must stop there — the 9 and
   // the bonus token must never appear.
-  const specEos = new SpeculativeDecoder({
+  const specEos = await new SpeculativeDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "spec-eos",
@@ -264,7 +264,7 @@ class FixedDrafter implements Drafter {
   console.log("ok edge case: EOS accepted mid-draft stops generation, later drafts dropped");
 
   // Jacobi on the fake: converges to the same tokens, EOS included.
-  const jac = new JacobiDecoder({
+  const jac = await new JacobiDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "jac-eos",
@@ -281,7 +281,7 @@ class FixedDrafter implements Drafter {
 
   // Jacobi with a fully wrong initial guess still converges (worst case:
   // blockSize + 1 forwards for the block, by Theorem S2).
-  const jacWrong = new JacobiDecoder({
+  const jacWrong = await new JacobiDecoder({
     executor: fake,
     cache: fakeCache(),
     seqId: "jac-wrong",
@@ -301,8 +301,8 @@ class FixedDrafter implements Drafter {
   // token-equality claim, so the test asserts determinism, not equality
   // with the greedy baseline).
   const sampled: SamplingParams = { temperature: 0.7, topP: 1, topK: 0, maxTokens: 6, seed: 42 };
-  const mkSpec = () =>
-    new SpeculativeDecoder({
+  const mkSpec = async () =>
+    await new SpeculativeDecoder({
       executor: fake,
       cache: fakeCache(),
       seqId: "spec-sampled",
@@ -312,8 +312,8 @@ class FixedDrafter implements Drafter {
       eosTokenId: FAKE_EOS,
       draftLength: 3,
     }).generate();
-  const s1 = mkSpec();
-  const s2 = mkSpec();
+  const s1 = await mkSpec();
+  const s2 = await mkSpec();
   assert.deepEqual(s1.tokens, s2.tokens, "sampled speculative: same seed => same tokens");
   for (const t of s1.tokens) assert.ok(t >= 0 && t < FAKE_VOCAB, `sampled token ${t} in vocab`);
   console.log(`ok sampled speculative decoding is deterministic under a fixed seed: [${s1.tokens.join(", ")}]`);
@@ -359,7 +359,7 @@ const tokenizer = new ByteLevelTokenizer({
 const demoPrompt = tokenizer.encode("Hello world");
 const demoGreedy: SamplingParams = { temperature: 0, topP: 1, topK: 0, maxTokens: 12 };
 
-const base = new AutoregressiveDecoder({
+const base = await new AutoregressiveDecoder({
   executor: demoExecutor,
   cache: demoCache(),
   seqId: "demo-base",
@@ -371,7 +371,7 @@ const base = new AutoregressiveDecoder({
 console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in ${base.forwards} forwards`);
 
 {
-  const spec = new SpeculativeDecoder({
+  const spec = await new SpeculativeDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-spec",
@@ -392,7 +392,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
       `acceptance ${spec.draftAccepted}/${spec.draftProposed} = ${spec.acceptanceRate.toFixed(3)}`,
   );
 
-  const jac = new JacobiDecoder({
+  const jac = await new JacobiDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-jac",
@@ -409,7 +409,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
   );
 
   // Draft longer than remaining maxTokens on the real model.
-  const specLong = new SpeculativeDecoder({
+  const specLong = await new SpeculativeDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-spec-long",
@@ -419,7 +419,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
     eosTokenId: cfg.eosTokenId,
     draftLength: 8,
   }).generate(3);
-  const base3 = new AutoregressiveDecoder({
+  const base3 = await new AutoregressiveDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-base-3",
@@ -443,7 +443,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
 // output, alpha would be far lower; the honest claim here is exactness +
 // the cost-model arithmetic, not a speedup on this model.
 {
-  const measured = new SpeculativeDecoder({
+  const measured = await new SpeculativeDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-measure",
@@ -502,7 +502,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
     console.log(`  RESULT: alpha=${alpha.toFixed(4)} is above the beta=1 breakeven (${be1.toFixed(4)}).`);
   }
   // Exactness must hold on the measurement run too.
-  const base24 = new AutoregressiveDecoder({
+  const base24 = await new AutoregressiveDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-base-24",
@@ -517,7 +517,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
   // Second prompt: same measurement, to see whether the constant-output
   // collapse (and the high alpha it causes) is prompt-specific.
   const prompt2 = tokenizer.encode("The quick brown fox jumps");
-  const measured2 = new SpeculativeDecoder({
+  const measured2 = await new SpeculativeDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-measure-2",
@@ -527,7 +527,7 @@ console.log(`demo baseline (greedy, 12 tokens): [${base.tokens.join(", ")}] in $
     eosTokenId: cfg.eosTokenId,
     draftLength: 4,
   }).generate();
-  const base2 = new AutoregressiveDecoder({
+  const base2 = await new AutoregressiveDecoder({
     executor: demoExecutor,
     cache: demoCache(),
     seqId: "demo-base-2",

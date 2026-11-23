@@ -138,6 +138,37 @@ export interface WeightMapResponse {
   weightMap: VramWeightMap;
 }
 
+// --- vRAM chunk ops (remote VramAccess) ------------------------------------
+// JSON shapes for POST /mesh/vram/alloc and POST /mesh/vram/free. Reads
+// (GET /mesh/vram/read) and writes (POST /mesh/vram/write) carry raw
+// bytes as application/octet-stream — never JSON/base64 — with the
+// address in the query string (read) or as `vaddr` alongside the body
+// (write). See src/server/vram-kv.ts.
+
+/** POST /mesh/vram/alloc body: bytes to allocate, copies per page. */
+export interface VramAllocRequest {
+  sizeBytes: number;
+  replicas?: number;
+}
+
+/** POST /mesh/vram/alloc response: the allocation the worker holds. */
+export interface VramAllocResponse {
+  id: string;
+  vaddr: number;
+  /** Bytes actually reserved (sizeBytes rounded up to whole 4 MiB pages). */
+  sizeBytes: number;
+}
+
+/** POST /mesh/vram/write response. */
+export interface VramWriteResponse {
+  bytesWritten: number;
+}
+
+/** POST /mesh/vram/free response. */
+export interface VramFreeResponse {
+  freed: string;
+}
+
 /** Minimal tokenizer contract. The reference impl is byte-level (see model/tokenizer.ts). */
 export interface Tokenizer {
   readonly vocabSize: number;
@@ -171,7 +202,7 @@ export interface StageExecutor {
   readonly assignment: ShardAssignment;
   load(loader: WeightLoader): Promise<void>;
   embed(tokenIds: number[]): Tensor;
-  forward(input: Tensor, ctx: ForwardContext): Tensor;
+  forward(input: Tensor, ctx: ForwardContext): Promise<Tensor>;
   /** Bytes of weight memory this stage holds. */
   memoryBytes(): number;
 }
@@ -239,14 +270,30 @@ export type Sampler = (logits: Float32Array, params: SamplingParams) => number;
  * Physical K/V for a layer lives in fixed-size blocks; a sequence's blocks
  * are tracked by a block table. The scheduler only needs `usedBlocks()` for
  * admission control; the engine owns allocation.
+ *
+ * allocate/append/read/free are async: a vRAM-backed cache is remote
+ * (HTTP to donors), and the interface is one shape for both stores
+ * (docs/KV-DESIGN.md §2). usedBlocks()/totalBlocks() stay synchronous —
+ * pure in-memory counters in both implementations.
  */
 export interface PagedKVCache {
   readonly blockSize: number; // tokens per block
-  allocate(seqId: string, layer: number, numTokens: number): number[];
-  append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): void;
+  allocate(seqId: string, layer: number, numTokens: number): Promise<number[]>;
+  append(seqId: string, layer: number, position: number, key: Float32Array, value: Float32Array): Promise<void>;
   /** Concatenated K and V for `positions` (in order) for one layer. */
-  read(seqId: string, layer: number, positions: number[]): { keys: Float32Array; values: Float32Array };
-  free(seqId: string): void;
+  read(seqId: string, layer: number, positions: number[]): Promise<{ keys: Float32Array; values: Float32Array }>;
+  free(seqId: string): Promise<void>;
+  /**
+   * Release everything this cache holds — all sequences, all layers.
+   * For a vRAM-backed cache this flushes staged chunks first (so no
+   * committed KV sits un-replicated in host staging) and returns every
+   * chunk to the pool; for the host cache it resets the tables. The
+   * worker calls it on model switch and on shutdown so a vRAM cache
+   * cannot leak chunks (docs/KV-DESIGN.md §6.3, P4). Best-effort: a
+   * close that cannot free a chunk counts the failure and still
+   * releases the rest rather than rejecting.
+   */
+  close(): Promise<void>;
   usedBlocks(): number;
   totalBlocks(): number;
 }
@@ -575,6 +622,33 @@ export interface IVirtualRam {
   /** Heal after a donor dies: re-replicate pages that lost their last copy. */
   handleNodeLoss(nodeId: string): Promise<{ pagesRecovered: number; pagesLost: number }>;
   stats(): VramStats;
+}
+
+/**
+ * Minimal remote-vRAM access: the surface `VramPagedKVCache`
+ * (src/scheduler/kvcache-vram.ts) needs. Lives here (not in the
+ * prototype file) so the worker, the mesh client, and tests can
+ * reference it without importing the cache implementation.
+ * Implementations: `VirtualRamAccess` (in-process, in the prototype
+ * file) and `RemoteVramAccess` (HTTP, src/scheduler/kvcache-vram-remote.ts).
+ * All methods are async: vRAM lives across the network from the worker.
+ */
+export interface VramAccess {
+  /** Read `length` bytes starting at virtual address `vaddr`. */
+  read(vaddr: number, length: number): Promise<Uint8Array>;
+  /** Write `data` starting at virtual address `vaddr`. */
+  write(vaddr: number, data: Uint8Array): Promise<void>;
+  /**
+   * Allocate `sizeBytes` (rounded up to whole vRAM pages by the
+   * implementation) and return its id and base virtual address.
+   * `opts.replicas` overrides the implementation default when given.
+   */
+  alloc(
+    sizeBytes: number,
+    opts?: { replicas?: number },
+  ): Promise<{ id: string; vaddr: number }>;
+  /** Release an allocation created by alloc(). */
+  free(id: string): Promise<void>;
 }
 
 // --- vGPU: one virtual GPU dispatching across real devices -----------------

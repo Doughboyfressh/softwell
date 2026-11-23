@@ -66,6 +66,7 @@ import type { MeshServerHandlers } from "./mesh/protocol.ts";
 import { ContinuousBatchingScheduler } from "./scheduler/batch.ts";
 import { sampleLogits } from "./engine/sampling.ts";
 import { ModelRegistry, createWeightHandlers } from "./server/registry.ts";
+import { createKvHandlers } from "./server/vram-kv.ts";
 import { VirtualServer } from "./server/server.ts";
 import type { ServingContextFactory } from "./server/server.ts";
 import { VirtualRam } from "./hw/vram.ts";
@@ -92,6 +93,14 @@ export interface CliOptions {
    *  to the baseline. Passed to workers (engine modes) and the scheduler
    *  (decoding mode). */
   engineOptions: EngineOptions;
+  /**
+   * Where the workers keep their KV cache: "host" (worker-local memory,
+   * the default) or "vram" (pooled vRAM, replicated — docs/KV-DESIGN.md
+   * §5). Passed to every spawned worker as --kv-store. There is no
+   * runtime fallback: a vram worker whose vRAM is unreachable fails its
+   * stage load loudly and keeps the previous stage.
+   */
+  kvStore?: "host" | "vram";
 }
 
 function printHelp(): void {
@@ -125,6 +134,11 @@ Usage:
                                         token generation (Theorems S1/S2, greedy only)
     --draft-length K                    draft length / Jacobi block size (default 4)
 
+  KV cache store (default host):
+    --kv-store host|vram                host = worker-local memory;
+                                        vram = KV pages in pooled vRAM
+                                        (replicated, healed on donor loss)
+
 Defaults: --workers ${DEFAULT_WORKERS}, --port ${DEFAULT_ORCHESTRATOR_PORT}, --api-port ${DEFAULT_API_PORT}.
 The demo model (demo/models/demo-10m) is used for workers when no model is given and it exists.`);
 }
@@ -152,6 +166,11 @@ export function parseArgs(argv: string[]): CliOptions {
     else if (a === "--api-port") opts.apiPort = Number(argvRest[++i]);
     else if (a === "--model-dir") opts.modelDir = argvRest[++i];
     else if (a === "--memory") opts.memoryBytes = Number(argvRest[++i]);
+    else if (a === "--kv-store") {
+      const v = argvRest[++i];
+      if (v !== "host" && v !== "vram") throw new Error(`--kv-store must be "host" or "vram", got ${JSON.stringify(v)}`);
+      opts.kvStore = v;
+    }
     else if (a.startsWith("--")) throw new Error(`unknown flag: ${a}`);
     else rest.push(a);
   }
@@ -261,6 +280,8 @@ export interface BootClusterOptions {
   port: number;
   memoryBytes?: number;
   engineOptions: EngineOptions;
+  /** KV cache store for the spawned workers (default "host"). */
+  kvStore?: "host" | "vram";
   /** Local model directory workers load weights from at spawn. Workers
    *  open one weight loader at startup, so this pins what they can serve;
    *  it is NOT the active model — activation happens later, through the
@@ -325,6 +346,7 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
         opts.workerModelDir,
         "--port",
         "0",
+        ...(opts.kvStore !== undefined ? ["--kv-store", opts.kvStore] : []),
         ...engineFlags,
       ],
       { env, stdio: "inherit" },
@@ -427,6 +449,22 @@ export function buildFactory(
           const w = registry.getWorker(workerId);
           if (!w) throw new Error(`unknown worker ${workerId}`);
           return client.execute(`http://${w.host}:${w.port}`, { ...req, workerId });
+        },
+        // Free a finished sequence's KV on every stage worker. Before
+        // this the scheduler's default freeSequence was a no-op, so the
+        // worker caches leaked every finished sequence until the stage
+        // reloaded — a 997-token generation consumed 756 of the host
+        // cache's 1024 blocks and the next one OOMed ("no free blocks",
+        // 2026-11-23). Best-effort: a worker that is gone took its
+        // cache with it, so per-worker failures are swallowed.
+        freeSequence: async (seqId: string): Promise<void> => {
+          await Promise.allSettled(
+            stamped.assignments.map(async (a) => {
+              const w = registry.getWorker(a.workerId);
+              if (!w) return;
+              await client.freeSequence(`http://${w.host}:${w.port}`, seqId);
+            }),
+          );
         },
         sampler: sampleLogits,
         decode: (ids) => tokenizer.decode(ids),
@@ -543,6 +581,7 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
     port: opts.port,
     memoryBytes: opts.memoryBytes,
     engineOptions: opts.engineOptions,
+    kvStore: opts.kvStore,
     workerModelDir,
   });
   const { registry, meshServer, children, hypervisor, vm, servingState, getCluster } = cluster;
@@ -578,6 +617,16 @@ async function serveCluster(opts: CliOptions, bootModelDir: string | undefined):
   const weightHandlers = createWeightHandlers(modelRegistry);
   cluster.meshHandlers.getWeightMap = weightHandlers.getWeightMap;
   cluster.meshHandlers.getWeightTensor = weightHandlers.getWeightTensor;
+  // Attach the remote-vRAM chunk endpoints to the same mesh server:
+  // workers allocate KV chunks in pooled vRAM and read/write them as
+  // raw bytes through RemoteVramAccess (src/scheduler/kvcache-vram-remote.ts).
+  // The handlers call vm.ram directly; failover and staleness rules
+  // are VirtualRam's, not re-implemented here.
+  const kvHandlers = createKvHandlers(vm.ram);
+  cluster.meshHandlers.allocVram = kvHandlers.allocVram;
+  cluster.meshHandlers.readVram = kvHandlers.readVram;
+  cluster.meshHandlers.writeVram = kvHandlers.writeVram;
+  cluster.meshHandlers.freeVram = kvHandlers.freeVram;
   server = new VirtualServer({
     registry: modelRegistry,
     factory,

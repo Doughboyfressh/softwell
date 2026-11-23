@@ -1,8 +1,20 @@
 /**
- * softwell-machine — scheduler: vRAM-backed block-paged KV cache (prototype).
+ * softwell-machine — scheduler: vRAM-backed block-paged KV cache.
  *
- * VERDICT: NO-GO for decode in this phase (prototype only — do not wire
- * into the worker). CORRECTED 2026-11-22: the previous header's numbers
+ * STATUS (2026-11-23, KV-cache-in-vRAM phase): WIRED IN behind the
+ * `--kv-store vram` worker flag (default stays `host`). This class now
+ * declares `implements PagedKVCache`: the interface went async
+ * (docs/KV-DESIGN.md), so the async shape this file always had is now
+ * the interface itself. HARDENED 2026-11-22 (workstream 5): globally-
+ * unique block ids, block-granular unwritten-read throws, an infallible
+ * free(), serialized concurrent operations, short-read rejection, and
+ * a constructor guard against a totalBlocks smaller than one chunk.
+ * What remains: long-context decode still costs ~+75% at ctx 1024
+ * (item 2 below), so the default stays `host` until the read-cost
+ * work lands (sub-page reads, or a vGPU attention kernel that reads
+ * KV in place on the donor).
+ *
+ * CORRECTED 2026-11-22: the previous header's numbers
  * ("host ~0.02 ms, vRAM ~19 ms, ~1,000x slower", "~230 ms per decode
  * token", "2-4.5x decode slowdown") were written before any bench run
  * completed — no results file existed. Three real runs now exist (runs
@@ -36,8 +48,8 @@
  *     works. Alloc of one 4 MiB chunk (replicas=2): 38-212 ms,
  *     amortized over 1024 tokens — negligible per token.
  *   - Projected decode (host decode + measured vRAM read per token;
- *     a projection — the engine's forward() is synchronous and cannot
- *     drive the async cache, so this was not run end-to-end):
+ *     a projection — end-to-end numbers are measured in the KV phase
+ *     with the async engine driving this cache; see bench-kv-after.json):
  *       ctx 128:  +0.4% (run 4) to +3.5% (run 2) — negligible.
  *       ctx 1024: +75% in run 4 (0.42 -> 0.24 tok/s) — material.
  *     Absolute tok/s in the bench (0.9-1.9 tok/s at ctx 128) is far
@@ -45,50 +57,28 @@
  *     bench shares a 1.5-CPU cell with other workstreams running
  *     heavy benches concurrently, so absolute times are load-dominated
  *     and ratios/projections within a run are the reliable signal.
- * Why still NO-GO:
- *   1. The sync-interface problem below is decisive on its own: the
- *      engine cannot drive this cache without an async forward() or
- *      a synchronous blocking transport. No performance number fixes
- *      that in this phase.
- *   2. Long-context decode pays ~+75% (up to ~2x) for vRAM KV — too
+ * Cost that remains (why the default is still `host`):
+ *   1. Long-context decode pays ~+75% (up to ~2x) for vRAM KV — too
  *      much to accept by default at ctx 1024. Short contexts are
  *      nearly free, so performance alone would be GO-WITH-CONDITIONS
  *      (short contexts, or prefill-only), not an outright rejection.
- * What would have to change for this to become viable:
- *   1. The async-interface work (engine forward() async, or a
- *      worker-thread + Atomics.wait bridge) — see below. The bridge
- *      alone only fixes the interface, not the cost.
- *   2. A sub-millisecond small-read path in vRAM (sub-page transfers
+ * What would have to change for the default to flip:
+ *   1. A sub-millisecond small-read path in vRAM (sub-page transfers
  *      or a KV side-channel that does not move whole 4 MiB pages), or
  *      attention that does not re-read the full prefix every token
  *      (e.g. a vGPU attention kernel that reads KV in-place on the
  *      donor, so KV never crosses HTTP per token).
- *   3. For long contexts, the ~6-9x read ratio has to come down or be
+ *   2. For long contexts, the ~6-9x read ratio has to come down or be
  *      accepted as a capacity-vs-speed trade.
- * The one viable slice is PREFILL-ONLY staging: prefill appends are
- * already batched (one flush per full chunk, ~19-103 ms per 4 MiB
- * page, amortized ~0.02-0.10 ms/token) and prefill reads the prefix
- * once, not once per token. Even that needs the async-interface work
- * below, so it is a follow-up, not this phase.
  *
- * THE SYNC-INTERFACE PROBLEM (read this before integrating):
- * PagedKVCache (src/contracts.ts) is synchronous: append()/read()
- * return values, and TransformerStageExecutor.forward() — which is
- * itself synchronous — calls them inline, once per row per layer.
- * Any remote vRAM access is inherently async (HTTP to donors). There
- * is no way to satisfy the synchronous PagedKVCache interface with a
- * remote backing store without either
- *   (a) making the cache interface and forward() async (a cross-cutting
- *       engine change owned by the coordinator), or
- *   (b) a synchronous blocking transport (e.g. a worker thread that
- *       performs the async vRAM calls while the engine thread blocks
- *       on Atomics.wait over a SharedArrayBuffer — sketched, not built).
- * This file therefore implements the ASYNC twin of the interface: the
- * same method names and semantics, but every method returns a Promise.
- * It deliberately does NOT declare `implements PagedKVCache`, because
- * claiming that would be a lie the typechecker would catch. The class
- * is a faithful prototype of the async design and its measured costs;
- * the sync bridge is out of scope for this workstream.
+ * HISTORY — the sync-interface problem, solved 2026-11-23
+ * (docs/KV-DESIGN.md): PagedKVCache used to be synchronous and
+ * TransformerStageExecutor.forward() with it, so no remote (async)
+ * backing store could satisfy the interface. The interface and
+ * forward() went async instead of building a blocking transport
+ * (a worker-thread + Atomics.wait bridge was evaluated and rejected:
+ * it would block the worker's event loop for ~20-150 s on a single
+ * prefill, tripping the orchestrator's heartbeat timeouts).
  *
  * DESIGN
  * ------
@@ -138,7 +128,13 @@
  *     re-prefills the sequence). Only flushed chunks enjoy vRAM
  *     replication. This matches the host cache's failure semantics;
  *     vRAM adds donor-loss tolerance for flushed data, not worker-loss
- *     tolerance for in-flight data.
+ *     tolerance for in-flight data. And the tolerance stops at the
+ *     chunk TABLE: it lives only in this instance (which allocIds
+ *     belong to which seq/layer), so a replacement worker cannot
+ *     re-attach to flushed chunks even though their bytes survive in
+ *     vRAM — it must resubmit. Proven by
+ *     test/kvcache-vram-survival.test.ts; resuming would need a
+ *     snapshot/attach handover that does not exist yet.
  *
  * Reads — coalesced per chunk, staging-aware:
  *   - Requested positions are grouped by chunk; consecutive positions
@@ -148,10 +144,17 @@
  *   - A read of a position in a chunk no append ever touched throws.
  *     A read of an unwritten position inside a touched chunk returns
  *     zeros (the chunk's pages are zero-filled on alloc and a flush
- *     writes the zero tail with them). This is chunk-granular, where
- *     BlockPagedKVCache is block-granular (it throws when the *block*
- *     was never touched): the two agree whenever reads stay within
- *     appended prefixes, which is all the engine ever does.
+ *     writes the zero tail with them). This is BLOCK-granular since
+ *     2026-11-22 (workstream 5): each chunk tracks a per-block
+ *     written flag, so reads throw exactly when BlockPagedKVCache
+ *     throws. The prototype was chunk-granular (zeros for any
+ *     position in a touched chunk, and flushAll() on an untouched
+ *     chunk turned a throw into zeros) — verified by probe, fixed,
+ *     and covered by tests 12 and 19. The two caches now agree on
+ *     every read the engine can issue, not just on appended prefixes.
+ *   - A read that comes back short (fewer bytes than requested) or a
+ *     re-fetch that comes back short throws instead of serving
+ *     partial data.
  *
  * Replication / failure semantics — inherited from vRAM, not re-invented:
  *   - Every chunk allocation is created with `replicas` copies
@@ -181,42 +184,84 @@
  *
  * Concurrency: the engine drives one cache single-threaded (one
  * forward at a time per stage), so appends/reads to the same chunk
- * are not concurrent in practice. This class does not serialize
- * concurrent appends to the same chunk; do not drive it from two
- * forwards at once.
+ * are not concurrent in practice — but the prototype did not
+ * serialize concurrent operations at all, and a probe showed 32
+ * concurrent appends to one chunk creating 32 chunks (and 3
+ * concurrent allocate()s creating 3). Since 2026-11-22 (workstream
+ * 5) every public operation runs through a FIFO promise chain, so
+ * concurrent callers are serialized and the cap check, chunk growth
+ * and flush cannot interleave. Do not drive it from two forwards at
+ * once and expect parallelism — serialization is a correctness
+ * guard, not a concurrency design.
+ *
+ * HARDENING AUDIT 2026-11-22 (workstream 5) — method by method vs
+ * BlockPagedKVCache (src/scheduler/kvcache.ts). Fixed:
+ *   - allocate(): block ids were chunk-local (0,1,...) and collided
+ *     across sequences AND layers; now globally unique, monotonic,
+ *     never reused after free. Verified by probe (P1) and test 11.
+ *   - allocate(): the returned table is sliced to the logical blocks
+ *     requested, so its length matches the host on growing
+ *     allocates; on a SHRINKING re-allocate the host returns its
+ *     full table while this returns the shorter prefix — STANDING
+ *     divergence, pinned by test 11. The engine only grows.
+ *   - read(): unwritten-block reads returned zeros (chunk-granular)
+ *     and flushAll() on an untouched chunk turned a throw into
+ *     zeros; now block-granular throws, host-identical. Tests 12, 19.
+ *   - read()/ensureStaged(): short reads were served as partial
+ *     data; now they throw. Test 19.
+ *   - free(): threw when a vRAM free failed (after dropping local
+ *     state, leaking the alloc id) — and the decoders call free()
+ *     at generate() start with no try/catch, so a throw would abort
+ *     generation; the scheduler's freeSequence sites swallow
+ *     failures, so only the decoder path was exposed. free() now
+ *     never rejects; failures are counted in stats().freeFailures.
+ *     Test 18.
+ *   - allocate()/append(): concurrent callers double-allocated
+ *     chunks (32 chunks for 32 concurrent appends to one chunk);
+ *     now serialized. Test 13.
+ *   - Constructor: totalBlocks smaller than one chunk made every
+ *     allocate reject with a confusing OOM; now a loud error at
+ *     construction. Test 15.
+ * Standing (not fixable in this class, or deliberately kept):
+ *   - usedBlocks() counts whole reserved chunks (up to 63 extra
+ *     blocks per (seq, layer) at demo geometry) while the host
+ *     counts logical blocks. The scheduler (batch.ts) does not use
+ *     usedBlocks() for admission today (maxSequences + token
+ *     budget), so no live caller is misled; logicalBlocks() is the
+ *     host-equivalent count for future admission, usedBlocks() the
+ *     capacity backstop. Test 19 quantifies both.
+ *   - allocate() still reserves a whole chunk per (seq, layer) the
+ *     moment one token is appended — minimum allocation is one
+ *     4 MiB page; that is the chunking design, not a bug.
+ *   - The async twin still does NOT implement PagedKVCache (the
+ *     sync-interface problem below) — wiring still needs the bridge.
+ * Out-of-order appends (verified against the real paths): the
+ * transformer sorts rows per sequence by position
+ * (transformer.ts forward()), so prefill and autoregressive decode
+ * never append out of order. Speculative decoding
+ * (batch.ts decodeSpeculative, novel-decoding.ts SpeculativeDecoder)
+ * and Jacobi (JacobiDecoder) overwrite a rejected draft's K/V at its
+ * position via append(); that is in-order except when the overwritten
+ * position's chunk already flushed — once per 1024-token chunk
+ * boundary per layer at demo geometry — and then it costs one RMW
+ * fetch + one re-flush, which is correct (test 10 / probe P10) but
+ * slow, so speculative/Jacobi at a chunk boundary pays ~40 ms per
+ * affected layer. Append-after-free re-creates the sequence cleanly
+ * (test 14). Allocate beyond the cap rejects with VramKvError and
+ * leaves the cache usable, never falling back to host (test 15).
  */
 
 import { VRAM_PAGE_SIZE_BYTES } from "../contracts.ts";
-import type { IVirtualRam } from "../contracts.ts";
+import type { IVirtualRam, PagedKVCache, VramAccess } from "../contracts.ts";
 
 // ---------------------------------------------------------------------------
 // VramAccess — the minimal remote-vRAM surface this cache needs.
 // ---------------------------------------------------------------------------
-
-/**
- * Minimal remote-vRAM access. Deliberately small and independent of
- * workstream 1's weight loader: the coordinator wires this to the real
- * remote client (HTTP binary weight/KV endpoint on the orchestrator)
- * during integration. All methods are async: vRAM lives across the
- * network from the worker.
- */
-export interface VramAccess {
-  /** Read `length` bytes starting at virtual address `vaddr`. */
-  read(vaddr: number, length: number): Promise<Uint8Array>;
-  /** Write `data` starting at virtual address `vaddr`. */
-  write(vaddr: number, data: Uint8Array): Promise<void>;
-  /**
-   * Allocate `sizeBytes` (rounded up to whole vRAM pages by the
-   * implementation) and return its id and base virtual address.
-   * `opts.replicas` overrides the implementation default when given.
-   */
-  alloc(
-    sizeBytes: number,
-    opts?: { replicas?: number },
-  ): Promise<{ id: string; vaddr: number }>;
-  /** Release an allocation created by alloc(). */
-  free(id: string): Promise<void>;
-}
+// The interface lives in src/contracts.ts (next to IVirtualRam) so the
+// worker, the mesh client, and tests can reference it without importing
+// this file. Implementations: VirtualRamAccess below (in-process, used
+// by the measurement harness) and RemoteVramAccess
+// (src/scheduler/kvcache-vram-remote.ts, HTTP to the orchestrator).
 
 /**
  * VramAccess adapter over the in-process IVirtualRam coordinator
@@ -278,6 +323,17 @@ export interface VramPagedKVCacheOptions {
 interface Chunk {
   allocId: string;
   vaddr: number;
+  /** Physical block ids for this chunk's slots, globally unique across
+   *  the cache (assigned from a monotonic counter at chunk creation,
+   *  never reused after free — the host cache reuses ids via its
+   *  free-list, but reuse is not part of the contract and fresh ids
+   *  avoid ABA staleness if a caller ever holds a table past free). */
+  blockIds: number[];
+  /** Per-block written flags (1 = some position in the block was
+   *  appended). Read throws for a position in an unwritten block,
+   *  exactly like BlockPagedKVCache — chunk-granular zeros were a
+   *  prototype divergence, fixed 2026-11-22 (workstream 5). */
+  writtenBlocks: Uint8Array;
   /** Host staging buffer (chunkBytes), null once flushed to vRAM. */
   staging: Uint8Array | null;
   /** Float32 view over `staging` (null when staging is null). */
@@ -307,9 +363,14 @@ export interface VramKvStats {
   chunkFlushes: number;
   /** Read-modify-write fetches (out-of-order appends to flushed chunks). */
   rmwFetches: number;
+  /** vRAM frees that failed inside free() (local state was still
+   *  dropped; the allocation id is unrecoverable, so the bytes may
+   *  leak until the donor heals or restarts — counted, never thrown,
+   *  so free() cannot break generation). */
+  freeFailures: number;
 }
 
-export class VramPagedKVCache {
+export class VramPagedKVCache implements PagedKVCache {
   readonly blockSize: number;
   private readonly total: number;
   private readonly numKvHeads: number;
@@ -328,7 +389,20 @@ export class VramPagedKVCache {
   /** seqId -> layer -> ordered list of chunks (chunk i covers logical
    *  positions [i * chunkTokens, (i+1) * chunkTokens)). */
   private readonly tables: Map<string, Map<number, Chunk[]>>;
+  /** seqId -> layer -> largest numTokens ever requested by allocate()
+   *  (drives logicalBlocks(), the host-equivalent admission count). */
+  private readonly logicalTokens: Map<string, Map<number, number>>;
   private readonly counters: VramKvStats;
+  /** Next globally-unique physical block id (monotonic, never reused). */
+  private nextBlockId = 0;
+  /** FIFO serialization chain: every public operation runs inside
+   *  runSerialized(), so concurrent appends/allocates to the same
+   *  chunk cannot double-allocate or lose a write to a chunk another
+   *  append just flushed (verified by probe 2026-11-22: 32 concurrent
+   *  appends to one chunk created 32 chunks pre-fix, 1 post-fix).
+   *  The engine drives one forward at a time, so this costs nothing
+   *  on the serving path; it only guards against concurrent callers. */
+  private queue: Promise<void> = Promise.resolve();
 
   constructor(
     blockSize: number,
@@ -382,7 +456,15 @@ export class VramPagedKVCache {
     }
     this.chunkBytes = this.chunkTokens * this.bytesPerToken;
     this.blocksPerChunk = this.chunkTokens / blockSize;
+    if (this.total < this.blocksPerChunk) {
+      throw new VramKvError(
+        `VramPagedKVCache: totalBlocks ${this.total} is smaller than one chunk ` +
+          `(${this.blocksPerChunk} blocks of ${blockSize} tokens) — no allocation could ever fit; ` +
+          `raise totalBlocks to at least ${this.blocksPerChunk}`,
+      );
+    }
     this.tables = new Map();
+    this.logicalTokens = new Map();
     this.counters = {
       chunks: 0,
       stagedBytes: 0,
@@ -393,6 +475,7 @@ export class VramPagedKVCache {
       bytesWritten: 0,
       chunkFlushes: 0,
       rmwFetches: 0,
+      freeFailures: 0,
     };
   }
 
@@ -406,8 +489,26 @@ export class VramPagedKVCache {
     return this.chunkBytes;
   }
 
+  /** Run `fn` after all previously queued operations finish, in
+   *  FIFO order. Errors propagate to the caller but never break the
+   *  chain. Public methods serialize through this; private `*Inner`
+   *  methods call each other directly and must never re-enter it. */
+  private runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(() => fn());
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   /** Observable counters (see VramKvStats): read/write counts and bytes,
-   *  so the coordinator can see the amplification this cache causes. */
+   *  so the coordinator can see the amplification this cache causes.
+   *  chunks/stagedBytes/vramBytes are live snapshots; stagedBytes and
+   *  vramBytes count LOGICAL chunk bytes (chunkBytes per chunk) — the
+   *  physical vRAM holding is whole 4 MiB pages per chunk, which is
+   *  equal at demo-100m geometry (chunkBytes is exactly one page) and
+   *  larger for small test chunkTokens. */
   stats(): VramKvStats {
     let staged = 0;
     let vramBytes = 0;
@@ -428,12 +529,29 @@ export class VramPagedKVCache {
    * Grow the sequence's chunk list for `layer` so it can hold
    * `numTokens` tokens, allocating new chunks from vRAM as needed.
    * Returns the block table for that layer: physical block ids, in
-   * order, where block b lives in chunk floor(b / blocksPerChunk).
-   * The table is stable: a block id never changes while the sequence
-   * lives. Rejects with VramKvError on out-of-memory (cap reached or
-   * vRAM alloc failed) — no silent fallback to host memory.
+   * order, globally unique across sequences and layers (unlike the
+   * prototype, which numbered chunk slots 0..n per (seq, layer) and
+   * collided across both). The table is stable: a block id never
+   * changes while the sequence lives. Rejects with VramKvError on
+   * out-of-memory (cap reached or vRAM alloc failed) — no silent
+   * fallback to host memory.
+   *
+   * The returned table is sliced to the LOGICAL blocks the caller
+   * asked for (ceil(numTokens / blockSize)), so its length matches
+   * BlockPagedKVCache on every growing allocate — but the host cache
+   * returns its FULL table, so on a shrinking re-allocate (fewer
+   * tokens than before) the host returns the full table while this
+   * returns the shorter prefix. The engine only ever grows
+   * (positions increase), so this is a documented divergence, not a
+   * live one. usedBlocks() still counts the whole reserved chunks —
+   * that is what vRAM actually holds; logicalBlocks() is the
+   * host-equivalent count for admission control.
    */
   async allocate(seqId: string, layer: number, numTokens: number): Promise<number[]> {
+    return this.runSerialized(() => this.allocateInner(seqId, layer, numTokens));
+  }
+
+  private async allocateInner(seqId: string, layer: number, numTokens: number): Promise<number[]> {
     if (!Number.isInteger(numTokens) || numTokens < 0) {
       throw new VramKvError(
         `VramPagedKVCache.allocate: numTokens must be a non-negative integer, got ${numTokens}`,
@@ -449,6 +567,13 @@ export class VramPagedKVCache {
       table = [];
       perLayer.set(layer, table);
     }
+    // Track the largest request per (seq, layer) for logicalBlocks().
+    let perLayerLogical = this.logicalTokens.get(seqId);
+    if (perLayerLogical === undefined) {
+      perLayerLogical = new Map();
+      this.logicalTokens.set(seqId, perLayerLogical);
+    }
+    perLayerLogical.set(layer, Math.max(perLayerLogical.get(layer) ?? 0, numTokens));
     const needed = Math.ceil(numTokens / this.chunkTokens);
     if ((this.usedBlocks() + (needed - table.length) * this.blocksPerChunk) > this.total) {
       throw new VramKvError(
@@ -469,30 +594,25 @@ export class VramPagedKVCache {
         );
       }
       const staging = new Uint8Array(this.chunkBytes);
+      const blockIds: number[] = [];
+      for (let b = 0; b < this.blocksPerChunk; b++) blockIds.push(this.nextBlockId++);
       table.push({
         allocId: alloc.id,
         vaddr: alloc.vaddr,
+        blockIds,
+        writtenBlocks: new Uint8Array(this.blocksPerChunk),
         staging,
         stagingF32: new Float32Array(staging.buffer),
         writtenUpTo: 0,
         flushed: false,
       });
     }
-    // Return exactly the logical blocks the caller asked for (like the
-    // host cache), even though whole chunks are reserved underneath:
-    // the tail block slots of the last chunk exist but are not listed
-    // until a later allocate() needs them. usedBlocks() still counts
-    // the whole reserved chunks — that is what vRAM actually holds.
     return this.blockTable(table).slice(0, Math.ceil(numTokens / this.blockSize));
   }
 
   private blockTable(table: Chunk[]): number[] {
     const out: number[] = [];
-    for (let c = 0; c < table.length; c++) {
-      for (let b = 0; b < this.blocksPerChunk; b++) {
-        out.push(c * this.blocksPerChunk + b);
-      }
-    }
+    for (const chunk of table) out.push(...chunk.blockIds);
     return out;
   }
 
@@ -513,6 +633,13 @@ export class VramPagedKVCache {
     this.counters.vramReads += 1;
     this.counters.bytesRead += data.length;
     this.counters.rmwFetches += 1;
+    if (data.length !== this.chunkBytes) {
+      throw new VramKvError(
+        `VramPagedKVCache: re-fetch of flushed chunk for seq ${seqId} layer ${layer} ` +
+          `(alloc ${chunk.allocId}) returned ${data.length} bytes, expected ${this.chunkBytes} — ` +
+          `committed KV may be unrecoverable; re-prefill the sequence`,
+      );
+    }
     const staging = new Uint8Array(this.chunkBytes);
     staging.set(data);
     chunk.staging = staging;
@@ -550,6 +677,10 @@ export class VramPagedKVCache {
    * with them, matching the read semantics for unwritten positions).
    */
   async flushAll(): Promise<void> {
+    return this.runSerialized(() => this.flushAllInner());
+  }
+
+  private async flushAllInner(): Promise<void> {
     for (const [seqId, perLayer] of this.tables) {
       for (const [layer, table] of perLayer) {
         for (const chunk of table) {
@@ -563,9 +694,23 @@ export class VramPagedKVCache {
    * Write one token's K/V for `layer` at absolute `position`.
    * Appends go to host staging; a chunk is flushed to vRAM exactly
    * once, when it fills. Rejects with VramKvError on OOM or on a
-   * failed chunk flush.
+   * failed chunk flush. Overwriting a position in an already-flushed
+   * chunk is correct (read-modify-write fetch, then re-flush) — the
+   * engine only does this for speculative/Jacobi corrections, and
+   * only when the corrected position sits in a chunk that already
+   * filled, i.e. at most once per chunk boundary per layer.
    */
   async append(
+    seqId: string,
+    layer: number,
+    position: number,
+    key: Float32Array,
+    value: Float32Array,
+  ): Promise<void> {
+    return this.runSerialized(() => this.appendInner(seqId, layer, position, key, value));
+  }
+
+  private async appendInner(
     seqId: string,
     layer: number,
     position: number,
@@ -582,8 +727,7 @@ export class VramPagedKVCache {
           `got key.length=${key.length}, value.length=${value.length}`,
       );
     }
-    const table = await this.allocate(seqId, layer, position + 1);
-    void table; // allocate() grows the table in place; re-read it below.
+    await this.allocateInner(seqId, layer, position + 1);
     const perLayer = this.tables.get(seqId) as Map<number, Chunk[]>;
     const chunks = perLayer.get(layer) as Chunk[];
     const chunkIndex = Math.floor(position / this.chunkTokens);
@@ -594,6 +738,7 @@ export class VramPagedKVCache {
     const base = offsetInChunk * 2 * this.kvDim;
     stagingF32.set(key, base);
     stagingF32.set(value, base + this.kvDim);
+    chunk.writtenBlocks[Math.floor(offsetInChunk / this.blockSize)] = 1;
     if (offsetInChunk + 1 > chunk.writtenUpTo) {
       chunk.writtenUpTo = offsetInChunk + 1;
     }
@@ -607,10 +752,24 @@ export class VramPagedKVCache {
    * one layer. Each returned array has shape [positions.length, kvDim].
    * Consecutive positions in one chunk are fetched with a single
    * coalesced vRAM read; staged chunks are served from host memory.
-   * Rejects with VramKvError when a needed vRAM page is unavailable
-   * on all copies — committed KV is never silently zero-filled.
+   * A read of a position in a block no append ever touched throws,
+   * exactly like BlockPagedKVCache (block-granular since 2026-11-22;
+   * the prototype returned chunk-granular zeros, and flushAll() on an
+   * untouched chunk even turned a throw into zeros). A read of an
+   * unwritten position inside a TOUCHED block returns zeros, like the
+   * host cache. Rejects with VramKvError when a needed vRAM page is
+   * unavailable on all copies, or when a read comes back short —
+   * committed KV is never silently zero-filled.
    */
   async read(
+    seqId: string,
+    layer: number,
+    positions: number[],
+  ): Promise<{ keys: Float32Array; values: Float32Array }> {
+    return this.runSerialized(() => this.readInner(seqId, layer, positions));
+  }
+
+  private async readInner(
     seqId: string,
     layer: number,
     positions: number[],
@@ -641,11 +800,6 @@ export class VramPagedKVCache {
           `VramPagedKVCache.read: position ${startPos} not allocated for seq ${seqId} layer ${layer}`,
         );
       }
-      if (chunk.writtenUpTo === 0 && !chunk.flushed) {
-        throw new VramKvError(
-          `VramPagedKVCache.read: no K/V written yet for seq ${seqId} layer ${layer} position ${startPos}`,
-        );
-      }
       // Extend the run while positions stay consecutive in this chunk.
       let j = i + 1;
       while (j < positions.length) {
@@ -662,6 +816,18 @@ export class VramPagedKVCache {
       }
       const runLength = j - i;
       const firstOffset = startPos % this.chunkTokens;
+      // Block-granular written check, before any vRAM traffic: every
+      // position in the run must sit in a block an append touched.
+      // (Checked per position, not per run, so a run spanning a
+      // written block, an unwritten block and a written block throws.)
+      for (let t = 0; t < runLength; t++) {
+        const blockInChunk = Math.floor((firstOffset + t) / this.blockSize);
+        if (chunk.writtenBlocks[blockInChunk] !== 1) {
+          throw new VramKvError(
+            `VramPagedKVCache.read: no K/V written yet for seq ${seqId} layer ${layer} position ${startPos + t}`,
+          );
+        }
+      }
       if (chunk.staging !== null) {
         // Served from host staging: no vRAM traffic.
         const stagingF32 = chunk.stagingF32 as Float32Array;
@@ -686,6 +852,13 @@ export class VramPagedKVCache {
               `positions ${startPos}..${startPos + runLength - 1} (alloc ${chunk.allocId}) — ` +
               `the page is unavailable on all copies; re-prefill the sequence`,
             { cause: err },
+          );
+        }
+        if (data.length !== byteLength) {
+          throw new VramKvError(
+            `VramPagedKVCache.read: vRAM read for seq ${seqId} layer ${layer} ` +
+              `positions ${startPos}..${startPos + runLength - 1} returned ${data.length} bytes, ` +
+              `expected ${byteLength} — re-prefill the sequence`,
           );
         }
         this.counters.vramReads += 1;
@@ -715,36 +888,80 @@ export class VramPagedKVCache {
   /**
    * Release every chunk owned by `seqId`, across all layers, back to
    * vRAM. No-op if unknown. Local state is dropped even when a vRAM
-   * free fails; failures are reported (the allocation may already be
-   * gone with a dead donor) rather than silently swallowed.
+   * free fails, and free() NEVER rejects: the host cache's free() is
+   * infallible, and the decoders call free() at the start of
+   * generate() (novel-decoding.ts) with no try/catch — a throw there
+   * would abort the whole generation — while the scheduler's
+   * freeSequence call sites already swallow failures. A failed vRAM
+   * free is counted in stats().freeFailures instead (the allocation
+   * id is gone, so the bytes may leak until donor healing/restart).
+   * The prototype threw here; that was a wiring hazard, fixed
+   * 2026-11-22 (workstream 5).
    */
   async free(seqId: string): Promise<void> {
+    return this.runSerialized(() => this.freeInner(seqId));
+  }
+
+  private async freeInner(seqId: string): Promise<void> {
     const perLayer = this.tables.get(seqId);
     if (perLayer === undefined) return;
     this.tables.delete(seqId);
-    const failures: string[] = [];
+    this.logicalTokens.delete(seqId);
     const frees: Array<Promise<void>> = [];
     for (const table of perLayer.values()) {
       for (const chunk of table) {
         frees.push(
-          this.vram.free(chunk.allocId).catch((err: unknown) => {
-            failures.push(
-              `${chunk.allocId}: ${err instanceof Error ? err.message : String(err)}`,
-            );
+          this.vram.free(chunk.allocId).catch(() => {
+            this.counters.freeFailures += 1;
           }),
         );
       }
     }
     await Promise.all(frees);
-    if (failures.length > 0) {
-      throw new VramKvError(
-        `VramPagedKVCache.free: ${failures.length} vRAM free(s) failed for seq ${seqId} ` +
-          `(local state dropped anyway): ${failures.join("; ")}`,
-      );
+  }
+
+  /**
+   * Release everything this cache holds: flush staged chunks to vRAM
+   * first (so no committed KV sits un-replicated in host staging at
+   * shutdown / model switch), then free every chunk of every sequence.
+   * Best-effort like free(): a flush or free that fails is counted in
+   * stats().freeFailures and the rest still release — close() never
+   * rejects, so the worker's shutdown path cannot fail on it.
+   */
+  async close(): Promise<void> {
+    return this.runSerialized(() => this.closeInner());
+  }
+
+  private async closeInner(): Promise<void> {
+    // Flush first; a failing flush must not stop the frees (the staged
+    // bytes belong to sequences that are being abandoned — the scheduler
+    // re-prefills them — so dropping them is consistent with free()).
+    try {
+      await this.flushAllInner();
+    } catch {
+      this.counters.freeFailures += 1;
+    }
+    const seqIds = [...this.tables.keys()];
+    for (const seqId of seqIds) {
+      await this.freeInner(seqId);
     }
   }
 
-  /** Blocks currently allocated (whole chunks count fully, as with the host cache). */
+  /**
+   * Blocks currently reserved (whole chunks count fully). This is
+   * what vRAM actually holds, and what allocate() enforces the cap
+   * against — so it is the honest number for capacity. It OVER-counts
+   * against the host cache: one 17-token sequence reserves a whole
+   * 64-block chunk per layer at demo geometry (1024 tokens/chunk),
+   * where the host counts 2 blocks. The scheduler (batch.ts) does
+   * not consult usedBlocks() for admission today — admission is
+   * maxSequences + token budget, despite contracts.ts claiming the
+   * scheduler "only needs usedBlocks() for admission control" — so
+   * no live caller is misled; any future admission control must use
+   * logicalBlocks() for host-like admission and treat usedBlocks()
+   * as the hard capacity backstop, or it will under-admit by up to
+   * (blocksPerChunk - 1) blocks per (sequence, layer).
+   */
   usedBlocks(): number {
     let used = 0;
     for (const perLayer of this.tables.values()) {
@@ -753,6 +970,21 @@ export class VramPagedKVCache {
       }
     }
     return used;
+  }
+
+  /** Host-equivalent block count: ceil(tokens / blockSize) per
+   *  (sequence, layer), from the largest allocate() request — what
+   *  BlockPagedKVCache.usedBlocks() would report for the same
+   *  workload. Use this for admission decisions that assume host
+   *  accounting; usedBlocks() remains the capacity truth. */
+  logicalBlocks(): number {
+    let logical = 0;
+    for (const perLayer of this.logicalTokens.values()) {
+      for (const numTokens of perLayer.values()) {
+        logical += Math.ceil(numTokens / this.blockSize);
+      }
+    }
+    return logical;
   }
 
   totalBlocks(): number {

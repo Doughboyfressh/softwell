@@ -16,8 +16,17 @@
  *     is also the vRAM donor holding half the weight replicas — is
  *     killed. The in-flight decode routed to the dead worker fails
  *     (it must be resubmitted; its KV cache is gone — the CLI logs the
- *     same contract). The survivor is re-planned to a single full
- *     stage; its re-load fetches the newly-owned layers from the
+ *     same contract). NOTE (2026-11-22, KV-in-vRAM phase): that
+ *     resubmit contract still holds for WORKER death — proven by
+ *     test/kvcache-vram-survival.test.ts, the replacement worker
+ *     cannot resume from vRAM KV because the chunk table (which
+ *     allocIds belong to which seq/layer) dies with the worker, even
+ *     though the flushed bytes survive in vRAM. It does NOT hold for
+ *     a pure DONOR death: flushed KV survives a donor dying (replicas
+ *     + healing) and the sequence can continue on the same workers.
+ *     This test kills worker-2, which is ALSO a donor, so the
+ *     resubmit here is a worker-death resubmit. The survivor is
+ *     re-planned to a single full stage; its re-load fetches the newly-owned layers from the
  *     weight endpoint WHILE the donor is still dead and unhealed (so
  *     the reads must fail over to the surviving replica), and only
  *     then is the pool healed. A fresh generation on the survivor
@@ -662,8 +671,14 @@ test(
       await h.killDonor(victimId);
       // The in-flight generation is interrupted: the next decode step
       // is routed to the dead worker and must fail (not hang). This is
-      // the documented contract — the sequence must be resubmitted
-      // after healing (its KV cache died with the worker).
+      // the documented contract for WORKER death — the sequence must
+      // be resubmitted after healing (its KV cache died with the
+      // worker). Proven at the cache level by
+      // test/kvcache-vram-survival.test.ts ("worker death"): the
+      // replacement worker cannot resume from vRAM KV because the
+      // chunk table dies with the worker. A pure DONOR death does
+      // NOT force a resubmit for flushed KV (same file: flushed
+      // chunks survive a donor dying and generation continues).
       await assert.rejects(
         decodeOne(next, pos),
         "decode routed to the dead worker must reject, not hang",
@@ -969,10 +984,11 @@ function makeStageToVram(ssd: FakeSsd, ram: FakeRam): (key: string) => Promise<V
 function makeStubCache(): PagedKVCache {
   return {
     blockSize: 16,
-    allocate: () => [],
-    append: () => {},
-    read: () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
-    free: () => {},
+    allocate: async () => [],
+    append: async () => {},
+    read: async () => ({ keys: new Float32Array(0), values: new Float32Array(0) }),
+    free: async () => {},
+    close: async () => {},
     usedBlocks: () => 0,
     totalBlocks: () => 0,
   };
@@ -1069,7 +1085,7 @@ test(
               data: new Float32Array(tokenIds.length * 2),
               shape: [tokenIds.length, 2],
             }),
-            forward: (_input: Tensor, _ctx: ForwardContext): Tensor => ({
+            forward: async (_input: Tensor, _ctx: ForwardContext): Promise<Tensor> => ({
               data: new Float32Array([marker]),
               shape: [1, 1],
             }),
