@@ -26,6 +26,7 @@
  * silent fallback to the FP32 path cannot pass as integration.
  */
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import test from "node:test";
 import { loadManifest, openWeightLoader } from "../src/model/loader.ts";
 import { loadTokenizer } from "../src/model/tokenizer.ts";
@@ -166,6 +167,24 @@ test("vNPU int8/fp8 token identity vs FP32 baseline (demo-100m)", async () => {
   await checkModel("demo/models/demo-100m", "demo-100m");
 });
 
-test("vNPU int8/fp8 token identity vs FP32 baseline (smollm-135m)", async () => {
+/**
+ * True when the model directory holds at least one safetensors weight
+ * file. SmolLM's weights (~489 MB) are never pushed to the repo, so a
+ * checkout without them (e.g. CI) cannot run the SmolLM leg at all —
+ * it skips instead of failing on a missing file.
+ */
+function hasSafetensors(modelDir: string): boolean {
+  try {
+    return readdirSync(modelDir).some((f) => f.endsWith(".safetensors"));
+  } catch {
+    return false;
+  }
+}
+
+test("vNPU int8/fp8 token identity vs FP32 baseline (smollm-135m)", async (t) => {
+  if (!hasSafetensors("models/smollm-135m")) {
+    t.skip("SmolLM weights not present — skipping (weights are never pushed to the repo)");
+    return;
+  }
   await checkModel("models/smollm-135m", "smollm-135m");
 });
