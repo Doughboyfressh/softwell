@@ -12,12 +12,19 @@ import type {
   EngineBackend,
   EngineOptions,
   ForwardContext,
+  IVirtualNpu,
+  IVirtualRam,
   ModelManifest,
+  NodeProvider,
+  NpuStats,
   ShardAssignment,
   StageExecutor,
   Tensor,
+  VramStats,
   WeightLoader,
+  WorkerInfo,
 } from "../contracts.ts";
+import { VirtualNpu } from "../hw/vnpu.ts";
 import { resolveEngineOptions } from "./options.ts";
 import {
   applyRope,
@@ -51,17 +58,67 @@ import {
 
 export class ReferenceTransformerBackend implements EngineBackend {
   readonly name = "softwell-ts";
+  private npu?: IVirtualNpu;
+  constructor(opts: { npu?: IVirtualNpu } = {}) {
+    this.npu = opts.npu;
+  }
   createStageExecutor(
     manifest: ModelManifest,
     assignment: ShardAssignment,
     options?: EngineOptions,
   ): StageExecutor {
-    return new TransformerStageExecutor(manifest, assignment, options);
+    return new TransformerStageExecutor(manifest, assignment, options, this.npu);
   }
 }
 
 /** Fixed KV-block size for the executor's incrementally maintained stats. */
 const STATS_BLOCK_SIZE = 32;
+
+/**
+ * The local vNPU device: a VirtualNpu backed by this process itself as
+ * the sole donor node, for executors that were not handed a device.
+ * This is the same reference implementation the coordinator runs
+ * (docs/VNPU.md §4.2: the first vNPU executes in-process on CPU
+ * donors), reporting device 'cpu' — it claims no NPU silicon. The
+ * RAM stub throws on any use: the matmul path never touches vRAM
+ * (weights stage from the fp32 copies the executor already holds),
+ * and stageFromVram is unsupported on a local device — a caller that
+ * needs vRAM-backed staging must inject a real device.
+ */
+function createLocalNpu(format: "int8" | "fp8"): VirtualNpu {
+  const self: WorkerInfo = {
+    workerId: "local",
+    host: "127.0.0.1",
+    port: 0,
+    device: "cpu",
+    backend: "softwell-ts",
+    memoryBytes: 0,
+    freeMemoryBytes: 0,
+    // Unknown until measured; never claim a number here (same rule as
+    // the vGPU bench's donor info). Device selection only compares
+    // resident SRAM, so the value does not affect execution.
+    flopsPerSec: 0,
+    bandwidthBytesPerSec: 0,
+    roles: ["mixed"],
+    maxBatchTokens: 128,
+    state: "healthy",
+    registeredAt: 0,
+    lastHeartbeatAt: 0,
+    usedMemoryBytes: 0,
+    activeSequences: 0,
+  };
+  const nodes: NodeProvider = { listNodes: () => [self] };
+  const ram: IVirtualRam = {
+    alloc: () => Promise.reject(new Error("local vNPU: vRAM alloc unsupported — inject a real device")),
+    free: () => Promise.reject(new Error("local vNPU: vRAM free unsupported — inject a real device")),
+    read: () => Promise.reject(new Error("local vNPU: vRAM read unsupported — inject a real device")),
+    write: () => Promise.reject(new Error("local vNPU: vRAM write unsupported — inject a real device")),
+    replicate: () => Promise.reject(new Error("local vNPU: vRAM replicate unsupported — inject a real device")),
+    handleNodeLoss: () => Promise.reject(new Error("local vNPU: vRAM handleNodeLoss unsupported — inject a real device")),
+    stats: (): VramStats => ({ totalBytes: 0, usedBytes: 0, freeBytes: 0, pages: 0, nodes: 0 }),
+  };
+  return new VirtualNpu({ nodes, ram, defaultFormat: format });
+}
 
 /** One layer's SW-code weights (parallel to LayerWeights, fp32 version). */
 interface PackedLayerWeights {
@@ -153,8 +210,25 @@ export class TransformerStageExecutor implements StageExecutor {
   private packedKvCache = new Map<string, PackedKvEntry>();
   private weightBytes = 0;
   private loaded = false;
+  /**
+   * The vNPU device this stage issues matmuls through when
+   * engineOptions.npu != "off" (null on the baseline path). When no
+   * device was injected, a local in-process device is built on demand
+   * (createLocalNpu); when one was injected it is used as given.
+   */
+  private npuDevice: IVirtualNpu | null = null;
+  /** Weight keys successfully staged into the device's SRAM. A matmul
+   *  only passes a weightKey the device actually holds: a key that
+   *  failed to stage (spill, eviction) falls back to on-the-fly
+   *  quantization of the fp32 weight instead of throwing. */
+  private stagedWeights = new Set<string>();
 
-  constructor(manifest: ModelManifest, assignment: ShardAssignment, options: EngineOptions = {}) {
+  constructor(
+    manifest: ModelManifest,
+    assignment: ShardAssignment,
+    options: EngineOptions = {},
+    npu?: IVirtualNpu,
+  ) {
     this.manifest = manifest;
     this.assignment = assignment;
     this.engineOptions = resolveEngineOptions(options);
@@ -164,6 +238,21 @@ export class TransformerStageExecutor implements StageExecutor {
           "(attentionPackedKV has no block-mean variant) — use one or the other",
       );
     }
+    if (this.engineOptions.npu !== "off" && this.engineOptions.weightFormat !== "fp32") {
+      throw new Error(
+        "TransformerStageExecutor: vNPU execution (int8/fp8) cannot yet combine with SW-code weights " +
+          "(MATMUL_SW over packed weights is a separate path) — use --weights fp32 with --npu",
+      );
+    }
+    if (this.engineOptions.npu !== "off") {
+      this.npuDevice = npu ?? createLocalNpu(this.engineOptions.npu);
+    }
+  }
+
+  /** vNPU counters for this stage (null on the baseline path): matmul
+   *  counts, SRAM hits/misses/spills/evictions. */
+  npuStats(): NpuStats | null {
+    return this.npuDevice === null ? null : this.npuDevice.stats();
   }
 
   async load(loader: WeightLoader): Promise<void> {
@@ -174,6 +263,12 @@ export class TransformerStageExecutor implements StageExecutor {
       throw new Error(
         `TransformerStageExecutor.load: SW-code weights (${packedMode}) are not implemented for MoE experts yet — ` +
           `use --weights fp32 for MoE models`,
+      );
+    }
+    if (this.npuDevice !== null && cfg.numExperts !== undefined && cfg.numExperts > 0) {
+      throw new Error(
+        `TransformerStageExecutor.load: vNPU execution (${this.engineOptions.npu}) is not implemented for MoE experts yet — ` +
+          `use --npu off for MoE models`,
       );
     }
 
@@ -245,6 +340,25 @@ export class TransformerStageExecutor implements StageExecutor {
         layer.upProj = await take(`${p}.mlp.up_proj.weight`);
         layer.downProj = await take(`${p}.mlp.down_proj.weight`);
       }
+      // Stage this layer's dense weights into the vNPU's SRAM as
+      // quantized resident copies (docs/VNPU.md §2.1): the forward
+      // pass then issues MATMUL_INT8 / MATMUL_FP8 against resident
+      // weights instead of re-quantizing the fp32 weights per token.
+      // SW-code (packed) weights never reach here — the constructor
+      // rejects npu + non-fp32 weights.
+      if (this.npuDevice !== null && packedMode === null) {
+        const hidden = cfg.hiddenSize;
+        const qDim = cfg.numAttentionHeads * cfg.headDim;
+        const kvDim = cfg.numKeyValueHeads * cfg.headDim;
+        const inter = cfg.intermediateSize;
+        this.stageWeight(`${p}.self_attn.q_proj.weight`, layer.qProj as Float32Array, qDim, hidden);
+        this.stageWeight(`${p}.self_attn.k_proj.weight`, layer.kProj as Float32Array, kvDim, hidden);
+        this.stageWeight(`${p}.self_attn.v_proj.weight`, layer.vProj as Float32Array, kvDim, hidden);
+        this.stageWeight(`${p}.self_attn.o_proj.weight`, layer.oProj as Float32Array, hidden, qDim);
+        this.stageWeight(`${p}.mlp.gate_proj.weight`, layer.gateProj as Float32Array, inter, hidden);
+        this.stageWeight(`${p}.mlp.up_proj.weight`, layer.upProj as Float32Array, inter, hidden);
+        this.stageWeight(`${p}.mlp.down_proj.weight`, layer.downProj as Float32Array, hidden, inter);
+      }
       this.layers.set(i, layer);
     }
 
@@ -257,6 +371,9 @@ export class TransformerStageExecutor implements StageExecutor {
         this.lmHeadW = this.embedW;
       } else {
         throw new Error("TransformerStageExecutor.load: stage has lm_head but no lm_head.weight tensor");
+      }
+      if (this.npuDevice !== null && this.lmHeadW !== null) {
+        this.stageWeight("lm_head.weight", this.lmHeadW, cfg.vocabSize, cfg.hiddenSize);
       }
       if (packedMode !== null && this.lmHeadW !== null) {
         const vocab = cfg.vocabSize;
@@ -274,6 +391,91 @@ export class TransformerStageExecutor implements StageExecutor {
     }
 
     this.loaded = true;
+  }
+
+  /**
+   * Stage one fp32 weight into the vNPU's SRAM as a quantized resident
+   * copy (format = the --npu mode, per-channel scales for INT8).
+   * A stage that fails or does not fit (spill) is NOT fatal: the key
+   * is simply not recorded, and the matmul dispatch then quantizes
+   * the fp32 weight on the fly instead of throwing — a stage that
+   * does not fit degrades, it does not brick the model load. The
+   * spill/eviction is still visible in npuStats().
+   */
+  private stageWeight(key: string, data: Float32Array, rows: number, cols: number): void {
+    if (this.npuDevice === null) return;
+    try {
+      const staged = this.npuDevice.stageWeights(
+        key,
+        data,
+        rows,
+        cols,
+        this.engineOptions.npu as "int8" | "fp8",
+      );
+      if (staged.resident) this.stagedWeights.add(key);
+    } catch (err) {
+      console.warn(
+        `vNPU: staging ${key} failed (${err instanceof Error ? err.message : String(err)}) — ` +
+          `matmuls for it quantize on the fly`,
+      );
+    }
+  }
+
+  /**
+   * C = A @ B^T for one projection. On the baseline path this is the
+   * plain FP32 matmulTransposeB, byte-identical to v1. With --npu
+   * int8|fp8 the matmul is issued as a MATMUL_INT8 / MATMUL_FP8
+   * instruction on the vNPU: against the staged SRAM weight when
+   * `weightKey` was staged at load, else with on-the-fly
+   * quantization of B. Attention stays exact FP32 — only the matmuls
+   * go through the vNPU (docs/VNPU.md §1).
+   */
+  private async matmulTB(
+    a: Float32Array,
+    aRows: number,
+    aCols: number,
+    b: Float32Array,
+    bRows: number,
+    bCols: number,
+    weightKey?: string,
+  ): Promise<Float32Array> {
+    if (this.npuDevice === null) {
+      return matmulTransposeB(a, aRows, aCols, b, bRows, bCols);
+    }
+    const key = weightKey !== undefined && this.stagedWeights.has(weightKey) ? weightKey : undefined;
+    const result = await this.npuDevice.matmulTransposeB(a, aRows, aCols, b, bRows, bCols, {
+      format: this.engineOptions.npu as "int8" | "fp8",
+      weightKey: key,
+    });
+    return result.output;
+  }
+
+  /**
+   * SwiGLU MLP for a single row over vNPU-issued matmuls:
+   * down(silu(x @ gateW^T) * (x @ upW^T)). Same shape contract as
+   * swiglu in attention.ts; only used when npu != "off".
+   */
+  private async swigluNpu(
+    x: Float32Array,
+    gateW: Float32Array,
+    upW: Float32Array,
+    downW: Float32Array,
+    layerIdx: number,
+  ): Promise<Float32Array> {
+    const hiddenSize = x.length;
+    const intermediateSize = gateW.length / hiddenSize;
+    if (!Number.isInteger(intermediateSize)) {
+      throw new Error(`swigluNpu: gateW length ${gateW.length} not divisible by hiddenSize ${hiddenSize}`);
+    }
+    if (upW.length !== gateW.length || downW.length !== hiddenSize * intermediateSize) {
+      throw new Error("swigluNpu: weight shape mismatch");
+    }
+    const p = `model.layers.${layerIdx}`;
+    const gate = await this.matmulTB(x, 1, hiddenSize, gateW, intermediateSize, hiddenSize, `${p}.mlp.gate_proj.weight`);
+    const up = await this.matmulTB(x, 1, hiddenSize, upW, intermediateSize, hiddenSize, `${p}.mlp.up_proj.weight`);
+    const hidden = new Float32Array(intermediateSize);
+    for (let i = 0; i < intermediateSize; i++) hidden[i] = silu(gate[i]) * up[i];
+    return this.matmulTB(hidden, 1, intermediateSize, downW, hiddenSize, intermediateSize, `${p}.mlp.down_proj.weight`);
   }
 
   embed(tokenIds: number[]): Tensor {
@@ -336,7 +538,7 @@ export class TransformerStageExecutor implements StageExecutor {
       const logits =
         this.packedLmHeadW !== null
           ? matmulPackedBT(normed, rows, hidden, this.packedLmHeadW)
-          : matmulTransposeB(normed, rows, hidden, this.lmHeadW as Float32Array, vocab, hidden);
+          : await this.matmulTB(normed, rows, hidden, this.lmHeadW as Float32Array, vocab, hidden, "lm_head.weight");
       return { data: logits, shape: [rows, vocab] };
     }
     return { data: x, shape: [rows, hidden] };
@@ -514,6 +716,7 @@ export class TransformerStageExecutor implements StageExecutor {
     const qDim = numHeads * headDim;
     const kvDim = numKvHeads * headDim;
     const packed = this.packedLayers.get(layerIdx);
+    const layerPrefix = `model.layers.${layerIdx}`;
     const bySeq = new Map<string, number[]>();
     for (const r of order) {
       const seqId = ctx.seqIds[r] as string;
@@ -563,7 +766,7 @@ export class TransformerStageExecutor implements StageExecutor {
           );
           const projected = packed
             ? matmulPackedBT(headOut, 1, hidden, packed.oProj)
-            : matmulTransposeB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden);
+            : await this.matmulTB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden, `${layerPrefix}.self_attn.o_proj.weight`);
           attnOut.set(projected, r * hidden);
         }
         continue;
@@ -578,7 +781,7 @@ export class TransformerStageExecutor implements StageExecutor {
         const headOut = result.output.subarray(j * hidden, (j + 1) * hidden);
         const projected = packed
           ? matmulPackedBT(headOut, 1, hidden, packed.oProj)
-          : matmulTransposeB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden);
+          : await this.matmulTB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden, `${layerPrefix}.self_attn.o_proj.weight`);
         attnOut.set(projected, r * hidden);
       }
     }
@@ -608,19 +811,21 @@ export class TransformerStageExecutor implements StageExecutor {
       normed.set(rmsNorm(x.subarray(r * hidden, (r + 1) * hidden), layer.inputNorm, cfg.rmsNormEps), r * hidden);
     }
 
-    // --- q/k/v projections (batched matmuls; packed when SW-code is on) ---
+    // --- q/k/v projections (batched matmuls; packed when SW-code is on,
+    // --- vNPU-issued when --npu is set) ---
+    const p = `model.layers.${layerIdx}`;
     const q =
       packed !== undefined
         ? matmulPackedBT(normed, rows, hidden, packed.qProj)
-        : matmulTransposeB(normed, rows, hidden, layer.qProj as Float32Array, qDim, hidden);
+        : await this.matmulTB(normed, rows, hidden, layer.qProj as Float32Array, qDim, hidden, `${p}.self_attn.q_proj.weight`);
     const k =
       packed !== undefined
         ? matmulPackedBT(normed, rows, hidden, packed.kProj)
-        : matmulTransposeB(normed, rows, hidden, layer.kProj as Float32Array, kvDim, hidden);
+        : await this.matmulTB(normed, rows, hidden, layer.kProj as Float32Array, kvDim, hidden, `${p}.self_attn.k_proj.weight`);
     const v =
       packed !== undefined
         ? matmulPackedBT(normed, rows, hidden, packed.vProj)
-        : matmulTransposeB(normed, rows, hidden, layer.vProj as Float32Array, kvDim, hidden);
+        : await this.matmulTB(normed, rows, hidden, layer.vProj as Float32Array, kvDim, hidden, `${p}.self_attn.v_proj.weight`);
 
     // --- attention ---
     const attnOut = new Float32Array(rows * hidden);
@@ -654,7 +859,7 @@ export class TransformerStageExecutor implements StageExecutor {
         const projected =
           packed !== undefined
             ? matmulPackedBT(headOut, 1, hidden, packed.oProj)
-            : matmulTransposeB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden);
+            : await this.matmulTB(headOut, 1, hidden, layer.oProj as Float32Array, hidden, hidden, `${p}.self_attn.o_proj.weight`);
         attnOut.set(projected, r * hidden);
       }
     }
@@ -681,7 +886,10 @@ export class TransformerStageExecutor implements StageExecutor {
       } else if (packed !== undefined && packed.gateProj && packed.upProj && packed.downProj) {
         mlpOut = swigluPacked(h, packed.gateProj, packed.upProj, packed.downProj);
       } else if (layer.gateProj && layer.upProj && layer.downProj) {
-        mlpOut = swiglu(h, layer.gateProj, layer.upProj, layer.downProj);
+        mlpOut =
+          this.npuDevice !== null
+            ? await this.swigluNpu(h, layer.gateProj, layer.upProj, layer.downProj, layerIdx)
+            : swiglu(h, layer.gateProj, layer.upProj, layer.downProj);
       } else {
         throw new Error(`forward: layer ${layerIdx} has no MLP weights`);
       }

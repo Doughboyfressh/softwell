@@ -13,6 +13,7 @@ import type {
   DecodingMode,
   EngineOptions,
   KvFormat,
+  NpuMode,
   WeightFormat,
 } from "../contracts.ts";
 
@@ -21,11 +22,15 @@ export const DEFAULT_WEIGHT_FORMAT: WeightFormat = "fp32";
 export const DEFAULT_KV_FORMAT: KvFormat = "fp32";
 export const DEFAULT_DECODING: DecodingMode = "autoregressive";
 export const DEFAULT_DRAFT_LENGTH = 4;
+/** Default vNPU execution format: "off" — the executor never issues
+ *  vNPU instructions (docs/VNPU.md). */
+export const DEFAULT_NPU: NpuMode = "off";
 
 export const ATTENTION_MODES: AttentionMode[] = ["exact", "landmark", "sparse"];
 export const WEIGHT_FORMATS: WeightFormat[] = ["fp32", "sw2", "sw3", "sw4"];
 export const KV_FORMATS: KvFormat[] = ["fp32", "sw2", "sw3", "sw4"];
 export const DECODING_MODES: DecodingMode[] = ["autoregressive", "speculative", "jacobi"];
+export const NPU_MODES: NpuMode[] = ["int8", "fp8", "off"];
 
 /** Fill in every default. Pure: never mutates its input. */
 export function resolveEngineOptions(options: EngineOptions = {}): Required<EngineOptions> {
@@ -35,6 +40,7 @@ export function resolveEngineOptions(options: EngineOptions = {}): Required<Engi
     kvFormat: options.kvFormat ?? DEFAULT_KV_FORMAT,
     decoding: options.decoding ?? DEFAULT_DECODING,
     draftLength: options.draftLength ?? DEFAULT_DRAFT_LENGTH,
+    npu: options.npu ?? DEFAULT_NPU,
   };
 }
 
@@ -45,7 +51,8 @@ export function isBaselineOptions(options: EngineOptions = {}): boolean {
     r.attention === "exact" &&
     r.weightFormat === "fp32" &&
     r.kvFormat === "fp32" &&
-    r.decoding === "autoregressive"
+    r.decoding === "autoregressive" &&
+    r.npu === "off"
   );
 }
 
@@ -64,6 +71,7 @@ export function validateEngineOptions(options: EngineOptions): void {
   if (options.weightFormat !== undefined) checkEnum(options.weightFormat, WEIGHT_FORMATS, "weightFormat");
   if (options.kvFormat !== undefined) checkEnum(options.kvFormat, KV_FORMATS, "kvFormat");
   if (options.decoding !== undefined) checkEnum(options.decoding, DECODING_MODES, "decoding");
+  if (options.npu !== undefined) checkEnum(options.npu, NPU_MODES, "npu");
   if (options.draftLength !== undefined) {
     if (!Number.isInteger(options.draftLength) || options.draftLength < 1) {
       throw new Error(`invalid engine option draftLength: ${options.draftLength} (expected a positive integer)`);
@@ -72,11 +80,11 @@ export function validateEngineOptions(options: EngineOptions): void {
 }
 
 /**
- * Parse `--attention`, `--weights`, `--kv`, `--decoding`, `--draft-length`
- * out of an argv array (values `--flag value` or `--flag=value`). Unknown
- * flags are left alone — this parser only consumes the five it knows, so
- * callers must still reject anything else. Returns the options plus the
- * argv entries that were not consumed.
+ * Parse `--attention`, `--weights`, `--kv`, `--decoding`, `--draft-length`,
+ * `--npu` out of an argv array (values `--flag value` or `--flag=value`).
+ * Unknown flags are left alone — this parser only consumes the six it
+ * knows, so callers must still reject anything else. Returns the options
+ * plus the argv entries that were not consumed.
  */
 export function parseEngineFlags(argv: string[]): { options: EngineOptions; rest: string[] } {
   const options: EngineOptions = {};
@@ -115,6 +123,10 @@ export function parseEngineFlags(argv: string[]): { options: EngineOptions; rest
       }
       options.draftLength = n;
       i = next - 1;
+    } else if (flag === "--npu") {
+      const { value, next } = takeValue(argv, i, flag);
+      options.npu = checkEnum(value, NPU_MODES, "--npu");
+      i = next - 1;
     } else {
       rest.push(arg);
     }
@@ -136,14 +148,16 @@ export function engineOptionsToFlags(options: EngineOptions): string[] {
     r.decoding,
     "--draft-length",
     String(r.draftLength),
+    "--npu",
+    r.npu,
   ];
 }
 
-/** One-line summary for logs, e.g. "attention=landmark weights=sw3 kv=fp32 decoding=autoregressive". */
+/** One-line summary for logs, e.g. "attention=landmark weights=sw3 kv=fp32 decoding=autoregressive npu=off". */
 export function describeEngineOptions(options: EngineOptions): string {
   const r = resolveEngineOptions(options);
   return (
     `attention=${r.attention} weights=${r.weightFormat} kv=${r.kvFormat} ` +
-    `decoding=${r.decoding} draft-length=${r.draftLength}`
+    `decoding=${r.decoding} draft-length=${r.draftLength} npu=${r.npu}`
   );
 }

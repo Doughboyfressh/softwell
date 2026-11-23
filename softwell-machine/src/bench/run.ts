@@ -1,14 +1,14 @@
 /**
  * bench/run.ts — the `npm run bench` harness.
  *
- * Dynamically imports the four device bench modules
- * (bench-vgpu, bench-vcpu, bench-vram, bench-vssd), each exporting
+ * Dynamically imports the five device bench modules
+ * (bench-vgpu, bench-vcpu, bench-vram, bench-vssd, bench-vnpu), each exporting
  * `runBench(opts: BenchOptions): Promise<BenchResult[]>`, runs them
  * across the scaling curve 1..N donors, and prints the results via
  * printReport (src/bench/report.ts).
  *
  * Usage:
- *   node src/bench/run.ts [--donors N] [--json <path>] [--only vgpu|vcpu|vram|vssd]
+ *   node src/bench/run.ts [--donors N] [--json <path>] [--only vgpu|vcpu|vram|vssd|vnpu]
  *
  *   --donors N   run the scaling curve 1..N donors (default 1)
  *   --json PATH  also write the raw results JSON to PATH
@@ -22,9 +22,9 @@ import * as os from "node:os";
 import { printReport } from "./report.ts";
 import type { BenchOptions, BenchResult } from "./types.ts";
 
-type Device = "vgpu" | "vcpu" | "vram" | "vssd";
+type Device = "vgpu" | "vcpu" | "vram" | "vssd" | "vnpu";
 
-const DEVICES: Device[] = ["vgpu", "vcpu", "vram", "vssd"];
+const DEVICES: Device[] = ["vgpu", "vcpu", "vram", "vssd", "vnpu"];
 
 interface BenchModuleExports {
   runBench: (opts: BenchOptions) => Promise<BenchResult[]>;
@@ -47,10 +47,10 @@ interface CliArgs {
 
 function usage(): string {
   return [
-    "Usage: node src/bench/run.ts [--donors N] [--json <path>] [--only vgpu|vcpu|vram|vssd]",
+    "Usage: node src/bench/run.ts [--donors N] [--json <path>] [--only vgpu|vcpu|vram|vssd|vnpu]",
     "  --donors N   run the scaling curve 1..N donors (default 1)",
     "  --json PATH  also write the raw results JSON to PATH",
-    "  --only DEV   run only one device bench (default: all four)",
+    "  --only DEV   run only one device bench (default: all five)",
   ].join("\n");
 }
 

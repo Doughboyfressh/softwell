@@ -1,0 +1,162 @@
+[
+  {
+    "timestamp": "2026-11-23T07:39:26.953Z",
+    "setting": "npu=off",
+    "npu": "off",
+    "weights": "fp32",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 3.86154,
+    "perplexity": 47.539,
+    "chunkPpls": [
+      28.43,
+      55.82,
+      75.26,
+      42.77
+    ],
+    "prefillTokPerSec": 5.678,
+    "decodeTokPerSec": 5.844,
+    "loadSec": 2.5,
+    "weightBytes": 538060032,
+    "npuStats": null,
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        1.51,
+        1.7,
+        1.48
+      ]
+    }
+  },
+  {
+    "timestamp": "2026-11-23T07:45:38.036Z",
+    "setting": "npu=int8",
+    "npu": "int8",
+    "weights": "fp32",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 4.12082,
+    "perplexity": 61.61,
+    "chunkPpls": [
+      31.99,
+      74.38,
+      129.9,
+      46.61
+    ],
+    "prefillTokPerSec": 0.813,
+    "decodeTokPerSec": 0.546,
+    "loadSec": 6.6,
+    "weightBytes": 538060032,
+    "npuStats": {
+      "devices": [
+        {
+          "nodeId": "local",
+          "device": "cpu",
+          "sramBytes": 268435456,
+          "sramUsedBytes": 135301936
+        }
+      ],
+      "sramCapacityBytes": 268435456,
+      "sramUsedBytes": 135301936,
+      "sramHits": 36703,
+      "sramMisses": 0,
+      "sramSpills": 0,
+      "sramEvictions": 0,
+      "int8Matmuls": 36703,
+      "fp8Matmuls": 0,
+      "swMatmuls": 0,
+      "bf16Matmuls": 0,
+      "attentionCalls": 0,
+      "kvQuantizeCalls": 0,
+      "opsCompleted": 36703,
+      "opsFailed": 0
+    },
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        1.64,
+        1.63,
+        1.52
+      ]
+    }
+  },
+  {
+    "timestamp": "2026-11-23T08:14:22.651Z",
+    "setting": "npu=fp8",
+    "npu": "fp8",
+    "weights": "fp32",
+    "kv": "fp32",
+    "chunks": 4,
+    "seqLen": 64,
+    "textOffset": 1000000000,
+    "storiesInSlice": 322,
+    "tokensScored": 252,
+    "meanNll": 3.91386,
+    "perplexity": 50.092,
+    "chunkPpls": [
+      29.53,
+      56.99,
+      82.84,
+      45.17
+    ],
+    "prefillTokPerSec": 0.194,
+    "decodeTokPerSec": 0.129,
+    "loadSec": 24.5,
+    "weightBytes": 538060032,
+    "npuStats": {
+      "devices": [
+        {
+          "nodeId": "local",
+          "device": "cpu",
+          "sramBytes": 268435456,
+          "sramUsedBytes": 134484092
+        }
+      ],
+      "sramCapacityBytes": 268435456,
+      "sramUsedBytes": 134484092,
+      "sramHits": 36703,
+      "sramMisses": 0,
+      "sramSpills": 0,
+      "sramEvictions": 0,
+      "int8Matmuls": 0,
+      "fp8Matmuls": 36703,
+      "swMatmuls": 0,
+      "bf16Matmuls": 0,
+      "attentionCalls": 0,
+      "kvQuantizeCalls": 0,
+      "opsCompleted": 36703,
+      "opsFailed": 0
+    },
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        1.04,
+        1.1,
+        1
+      ]
+    }
+  }
+]

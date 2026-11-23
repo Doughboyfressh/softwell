@@ -154,12 +154,21 @@ function floatToHalf(value: number): number {
   return sign | ((exp + 15) << 10) | mant;
 }
 
+/**
+ * E4M3 decode, per the OCP spec (no infinities; 0x7f/0xff are NaN,
+ * 0x7e/0xfe is the max finite value 448) — matching the spec-correct
+ * decoder in src/model/manifest.ts. NOTE: this previously treated
+ * every exp==15 byte as Inf/NaN, so the encoder's own saturation
+ * value 0x7e decoded back to NaN; a max-magnitude element quantized
+ * to FP8 came back as NaN and silently zeroed every error bound
+ * that touched it (NaN comparisons are false).
+ */
 function fp8E4M3ToFloat(byte: number): number {
   const sign = (byte & 0x80) !== 0 ? -1 : 1;
   const exp = (byte >> 3) & 0x0f;
   const mant = byte & 0x07;
   if (exp === 0) return sign * (mant / 8) * Math.pow(2, -6);
-  if (exp === 15) return mant === 0 ? sign * Infinity : NaN;
+  if (exp === 15) return mant === 7 ? NaN : sign * (1 + mant / 8) * Math.pow(2, 8);
   return sign * (1 + mant / 8) * Math.pow(2, exp - 7);
 }
 
@@ -168,14 +177,23 @@ function floatToFp8E4M3(value: number): number {
   const sign = value < 0 ? 0x80 : 0;
   const abs = Math.abs(value);
   if (abs === 0) return sign;
-  if (!Number.isFinite(abs)) return sign | 0x78;
+  // No infinity in E4M3: saturate at the max finite value (448, 0x7e).
+  if (!Number.isFinite(abs)) return sign | 0x7e;
   const exp = Math.floor(Math.log2(abs));
   if (exp > 8) return sign | 0x7e; // saturate at max finite (448)
-  if (exp < -9) return sign;
+  if (exp < -10) return sign;
   const biased = exp + 7;
   if (biased <= 0) return sign | Math.round(abs * Math.pow(2, 9));
-  const mant = Math.round((abs / Math.pow(2, exp) - 1) * 8);
-  return sign | (biased << 3) | mant;
+  let mant = Math.round((abs / Math.pow(2, exp) - 1) * 8);
+  let b = biased;
+  if (mant > 7) {
+    // Round-up carries into the exponent (as in floatToHalf above).
+    mant = 0;
+    b += 1;
+  }
+  // 0x7f is NaN, not 480: saturate instead of emitting it.
+  if (b > 15 || (b === 15 && mant === 7)) return sign | 0x7e;
+  return sign | (b << 3) | mant;
 }
 
 // ---------------------------------------------------------------------------

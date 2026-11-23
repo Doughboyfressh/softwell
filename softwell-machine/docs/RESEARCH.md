@@ -1145,6 +1145,55 @@ distributional assumption.
 
 ---
 
+## 11. The novel math as vNPU instructions
+
+> The instruction names, operand formats, and API surface below
+> are the core device workstream's API as landed
+> (`src/hw/vnpu.ts`, `IVirtualNpu` in `src/contracts.ts`,
+> design in `docs/VNPU.md`). Nothing here changes the status
+> of the theorems themselves (§10).
+
+The vNPU's instruction set (`docs/VNPU.md` §1) is the theorems
+in silicon form. The mapping, as implemented:
+
+| Theorem | vNPU instruction(s) | What changes vs the engine implementation |
+|---|---|---|
+| A1 (landmark attention, §4.1) | `ATTN_LANDMARK` (`vnpu.attention` / `vnpu.prefillAttention`, `mode: "landmark"`) | The block statistics ($\bar{k}_b$, $\bar{v}_b$, $R_b$, $S_b$) become device-resident state, built once per KV cache (`vnpu.buildBlockStats`, extended incrementally by `vnpu.extendBlockStats`) and reused per query; the $\delta_b \le \delta_{\max}$ gate is a per-block bound check inside the instruction, with `deltaMax` carried per instruction, not a host-side branch. The error bound is the same bound, evaluated on the same data, and reported with the result. |
+| A2 (dynamic sparsity, §4.2) | `ATTN_SPARSE` (`vnpu.attention` / `vnpu.prefillAttention`, `mode: "sparse"`) | The mass bound $B \cdot \exp(u_b - M)$ is computed on-device from resident landmark scores, with `dropThreshold` carried per instruction; skipped blocks are never fetched from vRAM at all (today the reference implementation still touches them to decide). The per-query screening and the no-eviction guarantee are unchanged. |
+| N1 (SW-code representation, §5.2) | `MATMUL_SW` (`vnpu.matmulSw`), `QUANTIZE` / `DEQUANTIZE` (`vnpu.quantizeSw` / `vnpu.dequantizeSw`) | The packed stream becomes the device's native weight format: `MATMUL_SW` consumes it directly with no FP32 materialisation, as `matmulPackedBT` does today — the difference is that the format is now the *storage* format in SRAM/vRAM, not an encoding applied at load. The per-element bound and the no-tail-term property are unchanged; `matmulSw` reports the N1 dot-product bound with the result. |
+| N2 (KV quantization, §5.3) | `KV_QUANTIZE` (`vnpu.quantizeKv`), `ATTN_PACKED_KV` (`vnpu.attentionPackedKv`) | Quantizing K/V per (token, KV head) after RoPE becomes a device instruction issued at append time, writing packed KV straight to vRAM. The bound is the same bound. Exact attention over the packed KV exists as `ATTN_PACKED_KV`, so the exact path does not inherit the engine's landmark/sparse + quantized-KV rejection (§9) — but landmark/sparse *over packed KV* remains open (see below). |
+
+What does **not** move into silicon:
+
+- **S1/S2 (speculative/Jacobi decoding, §7)** stay in the
+  scheduler. They are policies over forward passes, and their
+  exactness proofs are about the *sequence* of forwards, not
+  about any one op. The vNPU exposes no `SPECULATE` op.
+- **P1/P2/P3 (placement physics, §3)** stay in the planner.
+  They govern *where* instructions run, not *what* they do;
+  the vNPU's scheduler applies them to instruction placement
+  (VNPU.md §3.2) but does not re-prove them.
+
+Open questions remaining (see also VNPU.md §6):
+
+1. Whether `ATTN_LANDMARK` / `ATTN_SPARSE` can operate over
+   packed KV (`KV_QUANTIZE` output). The vNPU answers the
+   exact case with `ATTN_PACKED_KV`; the approximate cases
+   still need block statistics over quantized rows.
+2. Settled in v1: the A1/A2 thresholds (`delta_max`,
+   `drop_threshold`) are per-instruction immediates, passed
+   per call in the attention options — not per-device
+   registers. The theorems do not care; the API does, and it
+   chose immediates.
+3. SW-code at sw2/sw3 remains an issuable instruction
+   (`vnpu.matmulSw` accepts any `SwMode`), because the device
+   must not silently refuse a valid instruction — but the
+   scheduler must never select it for a real model without
+   error compensation, and the benchmark must record the
+   perplexity cost alongside any throughput win.
+
+---
+
 ## References
 
 All references below were verified by web search on 2026-11-22

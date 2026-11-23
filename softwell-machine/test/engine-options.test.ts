@@ -52,16 +52,30 @@ const MODEL_DIR = path.join(ROOT, "demo/models/demo-10m");
     kvFormat: "fp32",
     decoding: "autoregressive",
     draftLength: 4,
+    npu: "off",
   });
   assert.equal(isBaselineOptions({}), true);
   assert.equal(isBaselineOptions({ attention: "landmark" }), false);
   assert.equal(isBaselineOptions({ decoding: "speculative" }), false);
+  assert.equal(isBaselineOptions({ npu: "int8" }), false);
+  assert.equal(isBaselineOptions({ npu: "fp8" }), false);
 
   const parsed = parseEngineFlags(["run", "model", "--attention", "landmark", "--weights=sw3", "--draft-length", "8"]);
   assert.equal(parsed.options.attention, "landmark");
   assert.equal(parsed.options.weightFormat, "sw3");
   assert.equal(parsed.options.draftLength, 8);
   assert.deepEqual(parsed.rest, ["run", "model"]);
+
+  const parsedNpu = parseEngineFlags(["run", "model", "--npu", "int8"]);
+  assert.equal(parsedNpu.options.npu, "int8");
+  assert.deepEqual(parsedNpu.rest, ["run", "model"]);
+  const parsedNpuEq = parseEngineFlags(["--npu=fp8"]);
+  assert.equal(parsedNpuEq.options.npu, "fp8");
+  assert.equal(resolveEngineOptions({ npu: "fp8" }).npu, "fp8");
+  assert.throws(() => parseEngineFlags(["--npu", "bogus"]), /invalid engine option --npu/);
+  assert.throws(() => parseEngineFlags(["--npu"]), /missing value for --npu/);
+  assert.throws(() => validateEngineOptions({ npu: "bf16" as never }), /invalid engine option npu/);
+  validateEngineOptions({ npu: "int8" });
 
   assert.throws(() => parseEngineFlags(["--attention", "bogus"]), /invalid engine option --attention/);
   assert.throws(() => parseEngineFlags(["--weights"]), /missing value for --weights/);
@@ -71,7 +85,11 @@ const MODEL_DIR = path.join(ROOT, "demo/models/demo-10m");
 
   assert.equal(
     describeEngineOptions({ attention: "sparse", weightFormat: "sw3" }),
-    "attention=sparse weights=sw3 kv=fp32 decoding=autoregressive draft-length=4",
+    "attention=sparse weights=sw3 kv=fp32 decoding=autoregressive draft-length=4 npu=off",
+  );
+  assert.equal(
+    describeEngineOptions({ npu: "int8" }),
+    "attention=exact weights=fp32 kv=fp32 decoding=autoregressive draft-length=4 npu=int8",
   );
   console.log("ok options: defaults, parsing, validation");
 }

@@ -1,23 +1,26 @@
 /**
  * Hypervisor — the only component that knows donors exist AND pools exist.
  *
- * It wires the four hardware pools (vRAM, vGPU, vCPU, vSSD) together with a
- * NodeProvider and presents ONE VirtualMachine. Nothing above this module
- * ever sees a donor, a node id, or a pool coordinator: the VirtualMachine
- * object returned by boot() is the entire hardware platform for the LLM
- * runtime (see src/contracts.ts, "Virtual hardware").
+ * It wires the hardware pools (vRAM, vGPU, vCPU, vSSD, and the vNPU
+ * when one is registered) together with a NodeProvider and presents
+ * ONE VirtualMachine. Nothing above this module ever sees a donor, a
+ * node id, or a pool coordinator: the VirtualMachine object returned
+ * by boot() is the entire hardware platform for the LLM runtime (see
+ * src/contracts.ts, "Virtual hardware").
  *
- * Pools are injected through HypervisorOpts and spoken to only through the
- * IVirtual* interfaces from contracts.ts. This module never imports a
- * sibling hw module.
+ * Pools are injected through HypervisorOpts and spoken to only through
+ * the IVirtual* interfaces from contracts.ts. This module never imports
+ * a sibling hw module.
  */
 import { VRAM_PAGE_SIZE_BYTES } from "../contracts.ts";
 import type {
   IVirtualCpu,
   IVirtualGpu,
+  IVirtualNpu,
   IVirtualRam,
   IVirtualSsd,
   NodeProvider,
+  NpuStats,
   VirtualMachine,
   VirtualMachineInfo,
   VramAllocation,
@@ -30,6 +33,9 @@ export interface HypervisorOpts {
   gpu: IVirtualGpu;
   cpu: IVirtualCpu;
   ssd: IVirtualSsd;
+  /** The virtual NPU pool. Optional: VMs booted before the vNPU
+   *  existed have no npu field, and their summaries omit it. */
+  npu?: IVirtualNpu;
   /** How often sweep() runs on its own timer. Default 5000 ms. */
   sweepIntervalMs?: number;
   /** How long boot() waits for a healthy node before giving up. Default 10000 ms. */
@@ -40,13 +46,16 @@ export interface HypervisorOpts {
  * Summary of healing after one donor disappears. `errors` collects one
  * entry per pool whose handleNodeLoss threw (format "<pool>: <message>");
  * a throwing pool never prevents the other pools from healing, and its
- * counters stay at zero.
+ * counters stay at zero. `npu` is present only when a vNPU pool is
+ * registered (a hypervisor without one omits the field, so existing
+ * summaries compare equal).
  */
 export interface NodeLossSummary {
   ram: { pagesRecovered: number; pagesLost: number };
   gpu: { streamsReassigned: number; devicesLost: number };
   cpu: { tasksRequeued: number; tasksLost: number };
   ssd: { chunksRecovered: number; chunksLost: number };
+  npu?: { devicesLost: number; sramBytesLost: number };
   errors: string[];
 }
 
@@ -105,6 +114,7 @@ export class Hypervisor {
     this.opts.gpu.stats();
     this.opts.cpu.stats();
     this.opts.ssd.stats();
+    this.opts.npu?.stats();
 
     this.lastSeen = new Set(nodes.map((n) => n.workerId));
     this.vm = {
@@ -112,6 +122,7 @@ export class Hypervisor {
       gpu: this.opts.gpu,
       cpu: this.opts.cpu,
       ssd: this.opts.ssd,
+      ...(this.opts.npu !== undefined ? { npu: this.opts.npu } : {}),
       info: () => this.getVmInfo(),
     };
     this.booted = true;
@@ -130,11 +141,11 @@ export class Hypervisor {
     return this.vm;
   }
 
-  /** Aggregate the four pools' stats plus the current node list. */
+  /** Aggregate the pools' stats plus the current node list. */
   getVmInfo(): VirtualMachineInfo {
     this.assertBooted();
     const nodes = this.opts.nodes.listNodes();
-    return {
+    const info: VirtualMachineInfo = {
       vram: this.opts.ram.stats(),
       gpu: this.opts.gpu.stats(),
       cpu: this.opts.cpu.stats(),
@@ -145,6 +156,9 @@ export class Hypervisor {
         state: n.state,
       })),
     };
+    const npuStats: NpuStats | undefined = this.opts.npu?.stats();
+    if (npuStats !== undefined) info.npu = npuStats;
+    return info;
   }
 
   /**
@@ -180,7 +194,7 @@ export class Hypervisor {
   }
 
   /**
-   * Fan out healing to all four pools and collect the results. A pool that
+   * Fan out healing to all pools and collect the results. A pool that
    * throws does not prevent the others from healing; its error is recorded
    * in the returned summary's `errors` array and its counters stay zero.
    */
@@ -212,6 +226,14 @@ export class Hypervisor {
       summary.ssd = await this.opts.ssd.handleNodeLoss(nodeId);
     } catch (err) {
       summary.errors.push(`ssd: ${errorMessage(err)}`);
+    }
+    if (this.opts.npu !== undefined) {
+      try {
+        summary.npu = await this.opts.npu.handleNodeLoss(nodeId);
+      } catch (err) {
+        summary.errors.push(`npu: ${errorMessage(err)}`);
+        summary.npu = { devicesLost: 0, sramBytesLost: 0 };
+      }
     }
     return summary;
   }

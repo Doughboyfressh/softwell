@@ -43,13 +43,35 @@ The numbers the virtual devices must beat, from
 | vSSD | Micron 9650 (PCIe Gen6) | sequential write | 14 GB/s |
 | vSSD | Micron 9650 (PCIe Gen6) | random read | 5,500,000 IOPS |
 | vSSD | Micron 9650 (PCIe Gen6) | random write | 900,000 IOPS |
+| vNPU | Google TPU v6e (Trillium) (primary) | INT8 peak | 1,836 TOPS |
+| vNPU | Google TPU v6e (Trillium) (primary) | BF16 peak | 918 TFLOPS |
+| vNPU | Google TPU v6e (Trillium) (primary) | memory bandwidth | 1,638 GB/s |
+| vNPU | Google TPU v6e (Trillium) (primary) | memory capacity | 32 GB |
+| vNPU | Google TPU v5p (secondary) | INT8 peak | 918 TOPS |
+| vNPU | Google TPU v5p (secondary) | BF16 peak | 459 TFLOPS |
+| vNPU | Google TPU v5p (secondary) | FP8 peak | 459 TFLOPS |
+| vNPU | Google TPU v5p (secondary) | memory bandwidth | 2,765 GB/s |
+| vNPU | Google TPU v5p (secondary) | memory capacity | 95 GiB |
+| vNPU | AWS Trainium2 (secondary) | FP8 peak | 1,299 TFLOPS |
+| vNPU | AWS Trainium2 (secondary) | BF16 / FP16 peak | 667 TFLOPS |
+| vNPU | AWS Trainium2 (secondary) | memory bandwidth | 2,900 GB/s |
+| vNPU | AWS Trainium2 (secondary) | memory capacity | 96 GiB |
+| vNPU | AWS Trainium2 (secondary) | on-chip SRAM (SBUF) | 224 MiB |
+| vNPU | AWS Inferentia2 (secondary) | INT8 peak | 380 TOPS |
+| vNPU | AWS Inferentia2 (secondary) | FP16 / BF16 / cFP8 peak | 190 TFLOPS |
+| vNPU | AWS Inferentia2 (secondary) | memory bandwidth | 820 GiB/s (as published) |
+| vNPU | AWS Inferentia2 (secondary) | memory capacity | 32 GiB |
 
 Why these chips: Rubin R100 is the genuinely current best enterprise
 GPU (in full production since early 2026); B200 is kept as the
 secondary target because it is the widely deployed reference. EPYC
 9965 is still the shipping core-count leader (EPYC 9006 "Venice" is
 announced but has no shipping specs to benchmark against). Micron
-9650 is still the fastest shipping data-center SSD.
+9650 is still the fastest shipping data-center SSD. TPU v6e
+(Trillium) is the vNPU's primary target — the current
+inference-shaped TPU; v5p, Trainium2 and Inferentia2 are
+secondaries. The full vNPU target table, sources, and the v5p
+INT8-vs-FP8 provenance note are in docs/VNPU.md §5.2.
 
 Sources:
 
@@ -463,3 +485,63 @@ What this says, without flattery:
   that save bytes do not save time here. Their wins live where
   bytes cross a slow boundary (multi-donor serving) or where FLOPs
   are actually removed (attention at long context).
+
+## vNPU (measured 2026-11-22)
+
+`npm run bench -- --only vnpu --json vnpu-bench-results-2026-11-22.json`
+(11 rows, exit 0). Machine: AMD EPYC 9D25 126-Core Processor
+(4 cores visible), 7.7 GiB RAM, Node v24.22.1, linux x64; loadavg
+~1.0–1.7 during the run (quiet host). Raw JSON:
+`vnpu-bench-results-2026-11-22.json`. Perplexity / tok/s / kernel
+numbers are in `docs/VNPU.md` §5.3 (same machine, same day;
+`vnpu-perplexity-bench.json`, `vnpu-tok-bench.json`,
+`vnpu-kernel-bench.json`). Timestamps in the JSONs are UTC
+2026-11-23; the run was the evening of 2026-11-22 PST.
+
+| device | metric | measured | target | margin | donors | donors-to-beat | verdict |
+|---|---|---|---|---|---|---|---|
+| vnpu | INT8 TOPS (MATMUL_INT8, 512^3) | 0.000898 TOPS | 1,836 (v6e) | 0.00005% | 1 | 2,043,548 | FAIL |
+| vnpu | INT8 TOPS (MATMUL_INT8, 512^3) | 0.000898 TOPS | 918 (v5p) | 0.00010% | 1 | 1,021,774 | FAIL |
+| vnpu | INT8 TOPS (MATMUL_INT8, 512^3) | 0.000898 TOPS | 380 (Inferentia2) | 0.00024% | 1 | 422,957 | FAIL |
+| vnpu | FP8 TFLOPS (MATMUL_FP8, 512^3) | 0.001194 TFLOPS | 1,299 (Trainium2) | 0.00009% | 1 | 1,087,485 | FAIL |
+| vnpu | FP8 TFLOPS (MATMUL_FP8, 512^3) | 0.001194 TFLOPS | 459 (v5p) | 0.00026% | 1 | 384,262 | FAIL |
+| vnpu | BF16 TFLOPS (MATMUL_BF16, 512^3) | 0.001469 TFLOPS | 918 (v6e) | 0.00016% | 1 | 624,887 | FAIL |
+| vnpu | BF16 TFLOPS (MATMUL_BF16, 512^3) | 0.001469 TFLOPS | 667 (Trainium2) | 0.00022% | 1 | 454,031 | FAIL |
+| vnpu | memory bandwidth (vRAM → tile) | 1.332 GB/s | 2,765 (v5p) | 0.05% | 1 | 2,077 | FAIL |
+| vnpu | memory bandwidth (vRAM → tile) | 1.332 GB/s | 1,638 (v6e) | 0.08% | 1 | 1,230 | FAIL |
+| vnpu | pooled SRAM capacity | 256 MiB | 224 (Trainium2 SBUF) | 114.3% | 1 | 1 | PASS |
+| vnpu | aggregate INT8 TOPS (MATMUL_INT8, 512^3 x 1 donor) | 0.000897 TOPS | 1,836 (v6e) | 0.00005% | 1 | 2,047,064 | FAIL |
+
+What the numbers actually say:
+
+- **Every throughput row FAILs by 5–6 orders of magnitude**,
+  as predicted — one 4-core CPU donor's INT8/FP8 matmul is
+  ~10⁶× short of a TPU v6e's INT8 tensor cores, and local DRAM
+  copy bandwidth is ~10³× short of HBM. Same shape as the vGPU's
+  first numbers.
+- **The one PASS is the SRAM capacity row, and it is a design
+  constant (D1), not a timed rate:** 256 MiB per virtual device
+  already exceeds Trainium2's 224 MiB SBUF, so one donor passes
+  and the pooled aggregate is N × 256 MiB. Read it as "the
+  capacity bar is cleared by construction", not as a speed win.
+- **Perplexity (the question SW-code failed): FP8 costs little
+  (+5.4%: 50.092 vs 47.539 FP32 on 252 TinyStories tokens,
+  SmolLM-135M); INT8 costs +29.6% (61.610).** But neither saves
+  wall-clock time on this fallback: INT8 generates at 0.45 tok/s
+  vs 4.29 FP32 (0.10×), FP8 at 0.11 tok/s (0.026×). Full tables
+  in docs/VNPU.md §5.3.
+- **Why the quantized path is slow (measured, not assumed):**
+  every vNPU matmul re-derives the dequantized staged weight and
+  the full error-bound analysis from the staged payload — an
+  O(weight-size) pass per call — and the transformer's per-row
+  decode path issues ~210 such calls per token. FP32 beats
+  INT8/FP8 on every kernel shape measured (1.4× at 512^3, 14×
+  at lm_head m=1). The fix — caching the dequantized values +
+  analysis per staged weight — is a named follow-up for the
+  core-device workstream; until then the vNPU's INT8/FP8 win is
+  bytes moved, not wall-clock time, same as SW-code.
+- **Token identity (docs/VNPU.md §4.2 item 1): FP8 holds exactly**
+  on both models (16/16 tokens); INT8 holds on demo-100m but
+  diverges on real SmolLM-135M (first differing position 2,
+  13 of 16 tokens differ). Quantized execution changes tokens
+  at INT8 — recorded plainly, not hidden.

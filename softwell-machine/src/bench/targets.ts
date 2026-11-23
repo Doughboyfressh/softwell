@@ -33,6 +33,12 @@
  *   write, 5.5M random read IOPS, 900K random write IOPS.
  *   Still the fastest shipping data-center SSD (Micron product
  *   brief; Tom's Hardware, Jul 2025).
+ * - vNPU: Google TPU v6e (Trillium) is the PRIMARY target (1,836
+ *   INT8 TOPS, 918 BF16 TFLOPS, 1,638 GB/s, 32 GB); TPU v5p is the
+ *   secondary (918 INT8 TOPS, 459 BF16/FP8 TFLOPS, 2,765 GB/s,
+ *   95 GiB). Trainium2 and Inferentia2 are secondaries too — see
+ *   VNPU_TARGETS and docs/VNPU.md §5.2 for the full table and the
+ *   v5p INT8-vs-FP8 provenance note.
  *
  * Sources:
  * - https://www.nvidia.com/en-us/data-center/hgx/
@@ -116,5 +122,41 @@ export const VSSD_TARGETS: DeviceTargets = {
   sources: [
     "https://my.micron.com/products/storage/ssd/data-center-ssd/9650-ssd",
     "https://www.tomshardware.com/pc-components/ssds/microns-industry-first-pci-6-0-ssd-promises-sequential-reads-up-to-28-000-mb-s-245-tb-ssd-also-coming-for-those-who-need-capacity-more-than-cutting-edge-speed",
+  ],
+};
+
+/**
+ * vNPU targets (docs/VNPU.md §5.2, verified 2026-11-22). Primary:
+ * Google TPU v6e (Trillium) — the current-generation inference-shaped
+ * chip. Secondary: TPU v5p. Trainium2 (1,299 FP8 TFLOPS, 667 BF16,
+ * 2,900 GB/s, 96 GiB, 224 MiB SBUF) and Inferentia2 (380 INT8 TOPS,
+ * 190 BF16, 820 GiB/s, 32 GiB) are secondaries too, but DeviceTargets
+ * holds one secondary — their rows are built with explicit targets in
+ * bench-vnpu.ts. v5p INT8 918 TOPS is the Dec 2023 launch figure
+ * (The Register), not the current docs page (which lists FP8 459);
+ * both are recorded in VNPU.md §5.2.
+ */
+export const VNPU_TARGETS: DeviceTargets = {
+  primary: "Google TPU v6e (Trillium)",
+  secondary: "Google TPU v5p",
+  primaryMetrics: {
+    int8Tops: 1_836,
+    bf16Tflops: 918,
+    memoryBandwidthGBps: 1_638, // Google quotes v6e HBM in GB/s
+    memoryCapacityGB: 32,
+  },
+  secondaryMetrics: {
+    int8Tops: 918,
+    bf16Tflops: 459,
+    fp8Tflops: 459,
+    memoryBandwidthGBps: 2_765, // Google quotes v5p HBM in GB/s
+    memoryCapacityGB: 95,
+  },
+  sources: [
+    "https://docs.cloud.google.com/tpu/docs/v6e",
+    "https://docs.cloud.google.com/tpu/docs/v5p",
+    "https://www.theregister.com/on-prem/2023/12/06/google-unveils-tpu-v5p-pods-to-accelerate-ai-training/",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/trainium2.html",
+    "https://awsdocs-neuron.readthedocs-hosted.com/en/latest/about-neuron/arch/neuron-hardware/inferentia2.html",
   ],
 };
