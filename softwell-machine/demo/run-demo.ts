@@ -266,7 +266,15 @@ async function part2(): Promise<void> {
     check("streaming generation produced 8 tokens", gen1.tokens === 8);
 
     // Fault tolerance: kill one worker, watch the re-shard, generate again.
-    const pids = execSync('pgrep -f "mesh/worker.ts"').toString().trim().split("\n").filter(Boolean);
+    // Scope pgrep to THIS demo's own orchestrator (port 8410): a bare
+    // `pgrep -f "mesh/worker.ts"` matches every worker on the host, and
+    // in this shared tree sibling workstreams run their own clusters
+    // concurrently — an unscoped pgrep killed a sibling's worker and
+    // left this demo's own cluster untouched (demo FAILED its re-shard
+    // check). The demo's workers are spawned with
+    // `--orchestrator http://127.0.0.1:8410`, so this pattern matches
+    // only them.
+    const pids = execSync('pgrep -f "mesh/worker.ts --orchestrator http://127.0.0.1:8410"').toString().trim().split("\n").filter(Boolean);
     console.log(`  killing worker pid ${pids[0]} ...`);
     process.kill(Number(pids[0]), "SIGKILL");
     await sleep(18_000);

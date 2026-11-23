@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { createReferenceBackend } from "../engine/backend.ts";
 import { parseEngineFlags } from "../engine/options.ts";
 import { openWeightLoader } from "../model/loader.ts";
+import { VramWeightLoader } from "../model/vram-loader.ts";
 import { BlockPagedKVCache } from "../scheduler/kvcache.ts";
 import {
   DEFAULT_ORCHESTRATOR_PORT,
@@ -109,21 +110,69 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
   };
 
   /**
-   * Resolve the loader for an assignment. Absent modelDir keeps the v1
-   * behaviour (the spawn-time loader). A modelDir different from the
-   * currently loaded model opens (or reuses a cached) loader for that
-   * model. Returns null when the new model dir cannot be opened — the
-   * caller then keeps serving the old stage and retries on the next poll.
+   * Resolve the loader for an assignment — vRAM first, disk only as a
+   * fallback — and log which one was chosen, so a stage load's weight
+   * source is always visible in the worker log.
+   *
+   *  1. No modelId and no modelDir: the v1 behaviour (spawn-time loader).
+   *  2. Same model as the current stage, or a cached loader: reuse it
+   *     (a cached VramWeightLoader is reused without another map fetch).
+   *  3. modelId present: ask the orchestrator for the staged manifest +
+   *     weight map (GET /mesh/weights/map). Staged -> build a
+   *     VramWeightLoader whose tensor fetches hit the orchestrator's
+   *     binary endpoint (GET /mesh/weights, octet-stream) and cache it.
+   *     Not staged (404) -> fall through to the disk loader below.
+   *     Any other fetch failure -> null: keep the old stage and retry
+   *     on the next poll (do NOT silently serve a different model).
+   *  4. Disk fallback, ONLY when the orchestrator has not staged the
+   *     model (pre-activation / v1 path): openWeightLoader(modelDir).
+   *     A model dir that cannot be opened -> null, keep the old stage.
+   *     No modelDir at all -> the spawn-time loader (v1 behaviour).
+   * Returns null when the new model cannot be loaded — the caller then
+   * keeps serving the old stage and retries on the next poll.
    */
-  function loaderFor(assignment: ShardAssignment): WeightLoader | null {
-    if (assignment.modelDir === undefined) return opts.loader;
-    const key = assignment.modelId ?? assignment.modelDir;
+  async function loaderFor(assignment: ShardAssignment): Promise<WeightLoader | null> {
+    if (assignment.modelDir === undefined && assignment.modelId === undefined) {
+      return opts.loader;
+    }
+    // Step 1 above guarantees at least one of modelId/modelDir is set.
+    const key = (assignment.modelId ?? assignment.modelDir) as string;
     if (key === currentModelKey) return currentLoader;
     const cached = loaders.get(key);
     if (cached !== undefined) return cached;
+    if (assignment.modelId !== undefined) {
+      let staged;
+      try {
+        staged = await client.getWeightMap(opts.orchestratorUrl, assignment.modelId);
+      } catch (err) {
+        log(
+          `cannot fetch vRAM weight map for model ${assignment.modelId}: ${err instanceof Error ? err.message : String(err)}; keeping previous stage`,
+        );
+        return null;
+      }
+      if (staged !== null) {
+        const modelId = assignment.modelId;
+        const orchestratorUrl = opts.orchestratorUrl;
+        const vramLoader = new VramWeightLoader(staged.manifest, staged.weightMap, (name) =>
+          client.fetchWeightTensor(orchestratorUrl, modelId, name),
+        );
+        loaders.set(key, vramLoader);
+        log(
+          `using vRAM weight loader for model ${modelId} (${Object.keys(staged.weightMap).length} tensors staged on the orchestrator)`,
+        );
+        return vramLoader;
+      }
+      log(
+        `model ${assignment.modelId} is not staged in vRAM on the orchestrator; falling back to the disk loader`,
+      );
+    }
+    if (assignment.modelDir === undefined) return opts.loader;
     try {
       const opened = openWeightLoader(assignment.modelDir, assignment.modelId);
       loaders.set(key, opened);
+      log(
+        `using disk weight loader for model ${assignment.modelId ?? key} (orchestrator has not staged it)`,
+      );
       return opened;
     } catch (err) {
       log(
@@ -155,7 +204,7 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       // cannot be opened leaves the old executor, cache, assignment and
       // versions untouched — and knownVersion deliberately NOT advanced,
       // so the next heartbeat/assignment poll retries the switch.
-      const loader = loaderFor(resp.assignment);
+      const loader = await loaderFor(resp.assignment);
       if (loader === null) return false;
       const next = opts.backend.createStageExecutor(
         loader.manifest,
@@ -177,7 +226,7 @@ export async function startWorker(opts: StartWorkerOptions): Promise<WorkerHandl
       loadedVersion = resp.version;
       knownVersion = resp.version;
       log(
-        `loaded stage ${resp.assignment.stage} (layers ${resp.assignment.layerStart}-${resp.assignment.layerEnd}, model ${loader.manifest.modelId}, assignment v${resp.version})`,
+        `loaded stage ${resp.assignment.stage} (layers ${resp.assignment.layerStart}-${resp.assignment.layerEnd}, model ${loader.manifest.modelId}, assignment v${resp.version}) via ${loader instanceof VramWeightLoader ? "vRAM" : "disk"} weights`,
       );
       return true;
     })();

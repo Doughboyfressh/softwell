@@ -634,6 +634,13 @@ export class VirtualRam implements IVirtualRam {
    *  order. Throws when no copy answers. */
   private async fetchPageData(entry: PageEntry, pageId: string): Promise<Buffer> {
     for (const copy of entry.copies) {
+      // Never serve a stale copy: a replica whose version lags the page
+      // table holds pre-write bytes. Serving it on failover would
+      // silently return old data; skipping it fails loudly instead.
+      // (Writes now store to every copy, so a listed copy should always
+      // be current — this guard exists so any future path that leaves a
+      // stale copy behind degrades to an error, not corruption.)
+      if (copy.version !== entry.version) continue;
       const node = this.findNode(copy.nodeId);
       if (node === undefined || typeof node.hwPort !== "number") continue;
       // Binary first; a 404 on the binary route falls back to the JSON
@@ -1088,25 +1095,39 @@ export class VirtualRam implements IVirtualRam {
       }
     }
 
-    // Phase 2: batch-store each donor's pages in <=8-page requests.
-    // Segments whose batch did not confirm the primary fall through
-    // to the sequential store below (replica failover intact).
-    const storedPrimary = new Set<string>();
-    const byNode = new Map<string, Array<(typeof segments)[number]>>();
+    // Phase 2: batch-store each page to EVERY copy in <=8-page requests
+    // per donor. A replica that only holds stale bytes is worse than
+    // useless: if the primary dies before a read repairs it, failover
+    // serves the stale bytes as if they were current, and healing then
+    // re-replicates the stale bytes as the recovered page — the new
+    // data is silently lost. (The previous design stored only the
+    // primary and repaired replicas lazily on read; that left exactly
+    // this window, and the healing tests exposed it: post-kill reads
+    // returned zeros for pages whose primary had died.) A write is
+    // therefore not complete until every surviving copy holds the new
+    // bytes. Cost: a write sends replicas x the bytes (2x at the
+    // default replica count); reads and healing stay unchanged.
+    const storedCopies = new Set<string>(); // `${pageId}@${nodeId}`
+    const byNode = new Map<string, Array<{ pageId: string; data: Buffer }>>();
     for (const seg of segments) {
       const entry = this.pageTable.get(seg.pageId);
       if (entry === undefined) {
         throw new VramError(`vRAM: page table has no entry for ${seg.pageId}`);
       }
-      const primary = entry.copies[0];
-      if (primary === undefined) {
+      if (entry.copies.length === 0) {
         throw new VramError(
-          `vRAM: page ${seg.pageId} unavailable on all ${entry.copies.length} copies`,
+          `vRAM: page ${seg.pageId} unavailable on all 0 copies`,
         );
       }
-      const list = byNode.get(primary.nodeId) ?? [];
-      list.push(seg);
-      byNode.set(primary.nodeId, list);
+      const page = newPages.get(seg.pageId);
+      if (page === undefined) {
+        throw new VramError(`vRAM: page ${seg.pageId} has no new contents`);
+      }
+      for (const copy of entry.copies) {
+        const list = byNode.get(copy.nodeId) ?? [];
+        list.push({ pageId: seg.pageId, data: page });
+        byNode.set(copy.nodeId, list);
+      }
     }
     await runLimited(
       [...byNode.entries()],
@@ -1116,24 +1137,23 @@ export class VirtualRam implements IVirtualRam {
         if (node === undefined || typeof node.hwPort !== "number") return;
         for (const batch of batchesOf(items, VRAM_BATCH_PAGES)) {
           try {
-            await this.storePagesToNode(
-              nodeId,
-              batch.map((seg) => ({
-                pageId: seg.pageId,
-                data: newPages.get(seg.pageId) as Buffer,
-              })),
-            );
-            for (const seg of batch) storedPrimary.add(seg.pageId);
+            await this.storePagesToNode(nodeId, batch);
+            for (const item of batch) {
+              storedCopies.add(`${item.pageId}@${nodeId}`);
+            }
           } catch {
-            // Sequential store below handles this batch's segments.
+            // Sequential store below retries this batch's pages.
           }
         }
       },
     );
 
-    // Phase 3: per-segment finalization — sequential store only where
-    // the batch did not confirm the primary, then version bump and
-    // promotion exactly as before.
+    // Phase 3: per-segment finalization — retry any copy the batch did
+    // not confirm, drop copies that still fail, then bump the version
+    // and mark every surviving copy resident at the new version. The
+    // first surviving copy stays the primary (copies[0]); if the old
+    // primary died mid-write, the first surviving replica is promoted
+    // by the filter below.
     await runLimited(segments, VRAM_IO_CONCURRENCY, async (seg) => {
       const entry = this.pageTable.get(seg.pageId);
       if (entry === undefined) {
@@ -1143,42 +1163,29 @@ export class VirtualRam implements IVirtualRam {
       if (page === undefined) {
         throw new VramError(`vRAM: page ${seg.pageId} has no new contents`);
       }
-      // Store to the primary; on failure try the replicas in order and
-      // promote the first that answers to primary.
       const failedNodeIds: string[] = [];
-      let stored: PageRef | null = null;
-      if (storedPrimary.has(seg.pageId)) {
-        stored = entry.copies[0] as PageRef;
-      } else {
-        for (const copy of entry.copies) {
-          try {
-            await this.storePageToNode(copy.nodeId, seg.pageId, page);
-            stored = copy;
-            break;
-          } catch {
-            failedNodeIds.push(copy.nodeId);
-          }
+      for (const copy of entry.copies) {
+        if (storedCopies.has(`${seg.pageId}@${copy.nodeId}`)) continue;
+        try {
+          await this.storePageToNode(copy.nodeId, seg.pageId, page);
+          storedCopies.add(`${seg.pageId}@${copy.nodeId}`);
+        } catch {
+          failedNodeIds.push(copy.nodeId);
         }
       }
-      if (stored === null) {
+      const surviving = entry.copies.filter(
+        (c) => !failedNodeIds.includes(c.nodeId),
+      );
+      if (surviving.length === 0) {
         throw new VramError(
           `vRAM: write to page ${seg.pageId} failed on all copies`,
         );
       }
-      entry.copies = entry.copies.filter(
-        (c) => !failedNodeIds.includes(c.nodeId),
-      );
+      entry.copies = surviving;
       entry.version += 1;
-      entry.copies = [
-        stored,
-        ...entry.copies.filter((c) => c !== stored),
-      ];
-      stored.version = entry.version;
-      stored.state = "resident";
-      // Other replicas are now stale; they are re-replicated lazily by
-      // replicate() or on the next read of this page.
       for (const copy of entry.copies) {
-        if (copy !== stored) copy.state = "dirty";
+        copy.version = entry.version;
+        copy.state = "resident";
       }
     });
   }

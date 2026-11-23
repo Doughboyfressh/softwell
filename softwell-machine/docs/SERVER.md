@@ -70,8 +70,12 @@ donors; the CLI's factory builds the scheduler that drives them.
    disposed.
 4. **Serve.** Requests are admitted against the active model's
    scheduler, run prefill + decode across the pipeline stages on the
-   workers, and stream back as SSE or JSON. Workers load their own
-   shards from the model directory on the shared filesystem.
+   workers, and stream back as SSE or JSON. Workers load their stage
+   weights from pooled vRAM through the orchestrator's binary weight
+   endpoint (`GET /mesh/weights`); no weight bytes come from disk at
+   inference time. (The model directory is still read once at ingest —
+   manifest, tokenizer, staging to vSSD — and a fresh worker process
+   still needs a `--model-dir` to boot. See `docs/VRAM-WEIGHTS.md`.)
 5. **Unload** (`ModelRegistry.unload(id)`). Refuses the active model
    and a model still loading. Frees every vRAM allocation and leaves
    the model `"available"` — the vSSD copy and the local directory stay,
@@ -83,8 +87,10 @@ donors; the CLI's factory builds the scheduler that drives them.
 The registry may stage several models, but only one model is **active**
 per cluster. The reasons are structural, not policy:
 
-- Each worker holds **one weight loader** (opened from its `--model-dir`
-  at spawn) and one stage executor; switching models means reloading
+- Each worker holds **one weight loader per active model** (a
+  `VramWeightLoader` fetching tensors from pooled vRAM for a staged
+  model; the spawn `--model-dir` disk loader is only the starting
+  point) and one stage executor; switching models means reloading
   every worker's stage.
 - The KV cache on the workers belongs to the active model's geometry
   (layers, heads, head dim). A second model would need a second cache
@@ -132,9 +138,12 @@ model is active. A model can be loaded into the running server with
 Workers open one weight loader from the `--model-dir` they are spawned
 with, so `up` without `--model-dir` still starts workers on the demo
 model directory (`demo/models/demo-10m`) when it exists. Activating a
-different model re-plans the workers and each worker opens a loader
-for the new model's directory on demand (see `src/mesh/worker.ts`
-`loaderFor`); the spawn directory is only the starting point.
+different model re-plans the workers and each worker loads the new
+model's weights from pooled vRAM on demand — it asks the orchestrator
+for the staged weight map and builds a `VramWeightLoader` (see
+`src/mesh/worker.ts` `loaderFor`); the disk loader is used only when
+the orchestrator has not staged the model. The spawn directory is only
+the starting point, and a fresh worker process still needs one to boot.
 
 ### `softwell run` / `softwell serve` — boot, load, serve
 
@@ -247,7 +256,7 @@ curl -s -X POST http://127.0.0.1:8420/v1/models/load \
 ### `POST /v1/models/:id/activate`
 
 Make a loaded (`"ready"`) model the active one. Workers are
-re-planned onto it and open its weights on demand; the previous
+re-planned onto it and fetch its weights from vRAM on demand; the previous
 model's context is disposed. Returns the model entry (`200`).
 Unknown id is `404`, a model that is not ready is `409`.
 
@@ -451,13 +460,16 @@ Honest limits of this version. See also `docs/RESEARCH.md` and
   `POST /v1/models/:id/activate`, `POST /v1/models/:id/unload`) and
   at boot (`up --model-dir`, `run`, `serve`). `up` without a model
   starts a healthy server with nothing to serve until one is loaded.
-- **Workers share one filesystem in the reference implementation.**
-  Workers load weights from a local model directory (`modelDir` on
-  every assignment); they open a loader at spawn and additional ones
-  on demand when an assignment names a different model directory.
-  Multi-host model distribution via vSSD — staging weights on vSSD
-  and having remote workers fetch them — is future work; today every
-  worker must see the same model directory.
+- **Workers fetch weights from pooled vRAM, not from a shared
+  filesystem.** At load time the model is staged to vSSD and then to
+  vRAM (`ModelRegistry.load`); at activation each worker builds a
+  `VramWeightLoader` from the orchestrator's weight map and fetches
+  tensor bytes over the mesh (`GET /mesh/weights`). A worker no longer
+  needs to see the model directory to serve a staged model — the
+  directory is read once at ingest, and only a fresh worker process
+  still needs some `--model-dir` to boot (its spawn-time loader). The
+  disk loader remains only as a fallback for models the orchestrator
+  has not staged. See `docs/VRAM-WEIGHTS.md` for the proof.
 - **The CPU backend is compute-bound, so the novel byte-saving paths
   save bytes, not wall-clock time.** Measured on this backend
   (`docs/RESEARCH.md`): speculative decoding 0.91× and Jacobi 0.53×

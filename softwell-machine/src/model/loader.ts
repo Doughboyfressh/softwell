@@ -238,6 +238,10 @@ export function tensorFileFor(manifest: ModelManifest, name: string): string | u
 export class SafetensorsWeightLoader implements WeightLoader {
   readonly manifest: ModelManifest;
   private readonly dir: string;
+  /** Raw bytes actually read from disk (cache hits do not count). The
+   *  proof workstream asserts this stays 0 while inference runs from
+   *  vRAM; any nonzero value here means a stage load went to disk. */
+  bytesReadFromDisk = 0;
   /** Shard filename -> whole-file buffer, cached after first read. */
   private readonly fileCache = new Map<string, Buffer>();
   /** Shard filename -> byte offset where the data section starts. */
@@ -300,6 +304,7 @@ export class SafetensorsWeightLoader implements WeightLoader {
     if (cached) return cached;
     const filePath = path.join(this.dir, fileName);
     const buffer = fs.readFileSync(filePath);
+    this.bytesReadFromDisk += buffer.length;
     this.fileCache.set(fileName, buffer);
     this.dataStart.set(fileName, safetensorsHeaderLength(buffer));
     return buffer;
