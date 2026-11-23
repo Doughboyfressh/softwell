@@ -2,7 +2,8 @@
 
 Softwell is a **virtual computer**. The virtual machine *is* the hardware
 platform: one global virtual address space (vRAM), one virtual GPU (vGPU),
-a pool of virtual CPUs (vCPU), and one virtual object store (vSSD).
+a pool of virtual CPUs (vCPU), one virtual object store (vSSD), and one
+virtual neural processing unit (vNPU) — the inference specialist.
 Workloads — including the LLM inference runtime — are written against the
 virtual-hardware interfaces in `src/contracts.ts` only. They never touch a
 physical device. Physical machines are **resource donors** underneath: they
@@ -38,6 +39,10 @@ src/hw/vcpu.ts            vCPU: the task ISA (kind = opcode), dispatch,
                           work stealing, at-least-once retries.
 src/hw/vssd.ts            vSSD: chunked/replicated objects, streaming range
                           reads, 3-tier cache (hot LRU -> vRAM -> node disk).
+src/hw/vnpu.ts            vNPU: the inference specialist — INT8/FP8
+                          execution, attention and sparsity as
+                          virtual-silicon primitives, tile SRAM.
+                          Design in docs/VNPU.md; no device code yet.
 src/hw/hypervisor.ts      Boots the VM, sweeps for dead donors, fans out
                           handleNodeLoss, stages models vSSD -> vRAM.
 src/hw/node-server.ts     One HTTP server per donor mounting all /hw/* routes.
@@ -185,6 +190,16 @@ pipeline is real, the speed is whatever the hardware underneath is.
   continues identically); a worker dying still forces a resubmit
   (the chunk table dies with the worker — flushed bytes survive in
   vRAM but are unreachable without it).
+- **The vNPU is design only.** The fifth virtual device — INT8/FP8
+  execution, attention and sparsity as virtual-silicon primitives,
+  256 MiB of tile SRAM per device (design parameter D1) — is
+  specified in `docs/VNPU.md` with enterprise benchmark targets
+  (TPU v6e primary; v5p, Trainium2, Inferentia2 secondary) and
+  empty measured columns. No `src/hw/vnpu.ts` exists yet, no
+  instruction is executable, and no vNPU benchmark row has been
+  measured. The novel math it is built on (A1/A2 attention,
+  N1/N2 SW-code) already runs as engine code behind flags; the
+  device that makes them instructions does not exist yet.
 
 ## Mapping onto the existing softwell repo
 
@@ -200,7 +215,7 @@ The intended fit:
   `/v1/models`) and the cluster API (`/v1/cluster`) that this repo
   already serves — the dashboard in `src/dashboard/` is the reference
   version of that UI.
-- The original idea is now literal: the program *is* the virtual GPU, CPU, RAM, and SSD.
+- The original idea is now literal: the program *is* the virtual GPU, CPU, RAM, SSD, and NPU.
 - A trillion-parameter model is served by pointing the machine at enough
   donors; the web app never sees the difference between 2 donors and 200.
 

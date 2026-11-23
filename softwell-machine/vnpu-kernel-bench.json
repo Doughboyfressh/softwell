@@ -1,0 +1,221 @@
+[
+  {
+    "timestamp": "2026-11-23T08:20:44.843Z",
+    "note": "INT8/FP8 timed with staged (SRAM-resident) weights; per-call cost is activation quantization + the op. FP32 is the optimized matmulTransposeB kernel. Single host, 2 timed reps after warmup.",
+    "timedReps": 2,
+    "shapes": [
+      {
+        "shape": "q/o [1,576]x[576,576]",
+        "m": 1,
+        "k": 576,
+        "n": 576,
+        "flops": 663552,
+        "fp32": {
+          "ms": 2.93,
+          "tflops": 0.000227
+        },
+        "int8": {
+          "ms": 10.18,
+          "tops": 0.000065,
+          "maxAbsErrVsFp32": 0.1553,
+          "errorBound": 2.444,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 16.88,
+          "tops": 0.000039,
+          "maxAbsErrVsFp32": 1.067,
+          "errorBound": 40.89,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "gate/up [1,576]x[1536,576]",
+        "m": 1,
+        "k": 576,
+        "n": 1536,
+        "flops": 1769472,
+        "fp32": {
+          "ms": 1.61,
+          "tflops": 0.001102
+        },
+        "int8": {
+          "ms": 12.99,
+          "tops": 0.000136,
+          "maxAbsErrVsFp32": 0.1904,
+          "errorBound": 2.378,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 41.49,
+          "tops": 0.000043,
+          "maxAbsErrVsFp32": 0.9335,
+          "errorBound": 39.9,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "down [1,1536]x[576,1536]",
+        "m": 1,
+        "k": 1536,
+        "n": 576,
+        "flops": 1769472,
+        "fp32": {
+          "ms": 1.09,
+          "tflops": 0.001629
+        },
+        "int8": {
+          "ms": 23.18,
+          "tops": 0.000076,
+          "maxAbsErrVsFp32": 0.2378,
+          "errorBound": 6.263,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 42.44,
+          "tops": 0.000042,
+          "maxAbsErrVsFp32": 1.431,
+          "errorBound": 105.2,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "lm_head [1,576]x[49152,576]",
+        "m": 1,
+        "k": 576,
+        "n": 49152,
+        "flops": 56623104,
+        "fp32": {
+          "ms": 35.3,
+          "tflops": 0.001604
+        },
+        "int8": {
+          "ms": 506.94,
+          "tops": 0.000112,
+          "maxAbsErrVsFp32": 0.191,
+          "errorBound": 2.428,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 1353.86,
+          "tops": 0.000042,
+          "maxAbsErrVsFp32": 1.753,
+          "errorBound": 40.65,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "prefill gate [5,576]x[1536,576]",
+        "m": 5,
+        "k": 576,
+        "n": 1536,
+        "flops": 8847360,
+        "fp32": {
+          "ms": 5.52,
+          "tflops": 0.001604
+        },
+        "int8": {
+          "ms": 19.64,
+          "tops": 0.00045,
+          "maxAbsErrVsFp32": 0.1729,
+          "errorBound": 2.418,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 44.84,
+          "tops": 0.000197,
+          "maxAbsErrVsFp32": 1.085,
+          "errorBound": 40.53,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "square 256^3",
+        "m": 256,
+        "k": 256,
+        "n": 256,
+        "flops": 33554432,
+        "fp32": {
+          "ms": 20.75,
+          "tflops": 0.001617
+        },
+        "int8": {
+          "ms": 38.62,
+          "tops": 0.000869,
+          "maxAbsErrVsFp32": 0.1397,
+          "errorBound": 1.107,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 34.06,
+          "tops": 0.000985,
+          "maxAbsErrVsFp32": 0.8135,
+          "errorBound": 18.61,
+          "withinBound": true
+        }
+      },
+      {
+        "shape": "square 512^3",
+        "m": 512,
+        "k": 512,
+        "n": 512,
+        "flops": 268435456,
+        "fp32": {
+          "ms": 168.47,
+          "tflops": 0.001593
+        },
+        "int8": {
+          "ms": 287.86,
+          "tops": 0.000933,
+          "maxAbsErrVsFp32": 0.1922,
+          "errorBound": 2.165,
+          "withinBound": true
+        },
+        "fp8": {
+          "ms": 235.09,
+          "tops": 0.001142,
+          "maxAbsErrVsFp32": 1.287,
+          "errorBound": 36.25,
+          "withinBound": true
+        }
+      }
+    ],
+    "npuStats": {
+      "devices": [
+        {
+          "nodeId": "bench-npu",
+          "device": "cpu",
+          "sramBytes": 268435456,
+          "sramUsedBytes": 0
+        }
+      ],
+      "sramCapacityBytes": 268435456,
+      "sramUsedBytes": 0,
+      "sramHits": 28,
+      "sramMisses": 0,
+      "sramSpills": 0,
+      "sramEvictions": 0,
+      "int8Matmuls": 14,
+      "fp8Matmuls": 14,
+      "swMatmuls": 0,
+      "bf16Matmuls": 0,
+      "attentionCalls": 0,
+      "kvQuantizeCalls": 0,
+      "opsCompleted": 28,
+      "opsFailed": 0
+    },
+    "host": {
+      "node": "v24.22.1",
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": 4,
+      "cpuModel": "AMD EPYC 9D25 126-Core Processor",
+      "totalMemMiB": 7934,
+      "loadavg": [
+        1.23,
+        1.31,
+        1.13
+      ]
+    }
+  }
+]

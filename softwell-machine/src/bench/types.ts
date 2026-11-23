@@ -13,7 +13,7 @@
 
 export interface BenchResult {
   /** Which virtual device was measured. */
-  device: "vgpu" | "vcpu" | "vram" | "vssd";
+  device: "vgpu" | "vcpu" | "vram" | "vssd" | "vnpu";
   /** What was measured, e.g. "matmul TFLOPS (FP32, 2048^3)". */
   metric: string;
   /** Aggregate measured value across `donors` donors. */

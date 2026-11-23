@@ -76,6 +76,7 @@ import { VirtualRam } from "./hw/vram.ts";
 import { VirtualGpu } from "./hw/vgpu.ts";
 import { VirtualCpu } from "./hw/vcpu.ts";
 import { VirtualSsd } from "./hw/vssd.ts";
+import { VirtualNpu } from "./hw/vnpu.ts";
 import { Hypervisor } from "./hw/hypervisor.ts";
 
 const WORKER_ENTRY = fileURLToPath(new URL("./mesh/worker.ts", import.meta.url));
@@ -150,6 +151,15 @@ Usage:
                                         its own StageExecutor). Requires
                                         --decoding speculative. The draft model
                                         must share the target's tokenizer/vocab.
+    --npu int8|fp8|off                 vNPU execution format (default off).
+                                        Selects the format the virtual NPU
+                                        runs matmuls in when a stage executor
+                                        issues vNPU instructions (docs/VNPU.md).
+                                        The forward-pass integration that
+                                        actually issues them is a later
+                                        workstream; today the flag is parsed,
+                                        plumbed to the workers, and selects
+                                        the vNPU device's default format.
 
   KV cache store (default host):
     --kv-store host|vram                host = worker-local memory;
@@ -405,13 +415,26 @@ export async function bootCluster(opts: BootClusterOptions): Promise<BootedClust
     manifestPath: fileURLToPath(new URL("../data/vssd-manifest.json", import.meta.url)),
     ram,
   });
-  const hypervisor = new Hypervisor({ nodes, ram, gpu, cpu, ssd });
+  // The virtual NPU is a device in the machine whether or not the engine
+  // uses it: --npu selects the execution format (int8/fp8) the device
+  // defaults to, and "off" leaves the device present but unused by the
+  // forward pass. With --npu int8|fp8 the stage executors issue their
+  // matmuls as vNPU instructions (docs/VNPU.md); each executor builds
+  // or is handed its device — the coordinator-side device here is the
+  // hypervisor-registered one, the workers use local in-process devices.
+  const npu = new VirtualNpu({
+    nodes,
+    ram,
+    defaultFormat: opts.engineOptions.npu === "fp8" ? "fp8" : "int8",
+  });
+  const hypervisor = new Hypervisor({ nodes, ram, gpu, cpu, ssd, npu });
   const vm: VirtualMachine = await hypervisor.boot();
   const vmInfo = vm.info();
   console.log(
     `softwell: virtual machine booted — vRAM ${(vmInfo.vram.totalBytes / 1024 ** 3).toFixed(1)} GiB pooled, ` +
       `vGPU ${(vmInfo.gpu.totalFlopsPerSec / 1e12).toFixed(1)} TFLOP/s across ${vmInfo.gpu.devices.length} virtual device(s), ` +
-      `vCPU ${vmInfo.cpu.totalCores} cores, vSSD ${(vmInfo.ssd.totalBytes / 1024 ** 3).toFixed(1)} GiB`,
+      `vCPU ${vmInfo.cpu.totalCores} cores, vSSD ${(vmInfo.ssd.totalBytes / 1024 ** 3).toFixed(1)} GiB, ` +
+      `vNPU ${vmInfo.npu?.devices.length ?? 0} device(s) x ${((vmInfo.npu?.sramCapacityBytes ?? 0) / 1024 / 1024).toFixed(0)} MiB SRAM`,
   );
 
   const getCluster = (): ClusterSnapshot => {
